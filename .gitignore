@@ -1,0 +1,26 @@
+# Local notes & scratch — not part of the published plugin
+notes/
+
+# Profiler runtime artifacts (when the profiler is run from this repo)
+runs/
+state/
+*.profile.json
+*.profile.md
+events.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.eggs/
+*.egg-info/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Claude project-local settings (the plugin itself ships in .claude-plugin/, skills/, scripts/)
+.claude/settings.local.json
