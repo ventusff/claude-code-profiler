@@ -51,8 +51,75 @@ def windows_dir() -> Path:
     return state_root() / "windows"
 
 
-def active_pointer() -> Path:
-    return state_root() / "active.json"
+def _read_proc_status_ppid(pid: int) -> int | None:
+    try:
+        status = Path(f"/proc/{pid}/status").read_text()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+    m = re.search(r"^PPid:\s+(\d+)", status, re.M)
+    return int(m.group(1)) if m else None
+
+
+def _read_proc_comm(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip() or None
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def find_session_key() -> str:
+    """Return a stable identifier for the current Claude Code session.
+
+    Two concurrent Claude sessions on the same host must each have their own
+    "active window" pointer — otherwise one session's `/profile start` blocks
+    the other. We discover the session by walking up the process tree to the
+    nearest ancestor named `claude` and using its PID.
+
+    Resolution order:
+      1. `CLAUDE_PROFILER_SESSION_KEY` env var — explicit override (used by tests
+         and by anyone who wants to pin behavior).
+      2. `CLAUDE_SESSION_ID` env var — set by Claude Code in some contexts.
+      3. Walk parent process tree for an ancestor whose comm == "claude" (Linux).
+      4. Fallback: a single shared `standalone` key — preserves prior behavior
+         when the script is run outside Claude Code (e.g. local debugging).
+    """
+    override = os.environ.get("CLAUDE_PROFILER_SESSION_KEY")
+    if override:
+        return f"key-{override}"
+    sid = os.environ.get("CLAUDE_SESSION_ID")
+    if sid:
+        return f"sid-{sid}"
+    # Linux /proc walk
+    try:
+        pid = os.getppid()
+        seen: set[int] = set()
+        while pid and pid > 1 and pid not in seen:
+            seen.add(pid)
+            comm = _read_proc_comm(pid)
+            if comm == "claude":
+                return f"pid-{pid}"
+            ppid = _read_proc_status_ppid(pid)
+            if ppid is None:
+                break
+            pid = ppid
+    except Exception:
+        pass
+    return "standalone"
+
+
+def active_dir() -> Path:
+    return state_root() / "active"
+
+
+def active_pointer(session_key: str | None = None) -> Path:
+    """Return the per-session active-window pointer path.
+
+    `session_key=None` means "auto-detect from environment / process tree".
+    """
+    key = session_key if session_key is not None else find_session_key()
+    # Sanitize to a safe filename component (keys can include UUIDs etc.).
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", key) or "standalone"
+    return active_dir() / f"{safe}.json"
 
 
 # ---------------------------------------------------------------------------
@@ -734,8 +801,8 @@ def env_snapshot() -> dict:
     return keep
 
 
-def load_active() -> dict | None:
-    p = active_pointer()
+def load_active(session_key: str | None = None) -> dict | None:
+    p = active_pointer(session_key)
     if not p.is_file():
         return None
     try:
@@ -744,14 +811,14 @@ def load_active() -> dict | None:
         return None
 
 
-def save_active(state: dict) -> None:
-    p = active_pointer()
+def save_active(state: dict, session_key: str | None = None) -> None:
+    p = active_pointer(session_key)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(state, indent=2))
 
 
-def clear_active() -> None:
-    p = active_pointer()
+def clear_active(session_key: str | None = None) -> None:
+    p = active_pointer(session_key)
     if p.exists():
         p.unlink()
 
