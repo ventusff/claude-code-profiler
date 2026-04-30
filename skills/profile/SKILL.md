@@ -11,34 +11,38 @@ The user is invoking the profiler. Read the user's argument list, then run **exa
 
 ## Resolving the script path
 
-The script ships next to this skill inside the plugin. Pick the first existing path:
-
-1. Plugin install (preferred): `${CLAUDE_PLUGIN_ROOT}/scripts/cc_profiler.py`
-2. Project-mode dev (this repo cloned and used via `--plugin-dir .`, or as a project skill): `${CLAUDE_PROJECT_DIR}/scripts/cc_profiler.py`
-3. Installed as a binary on PATH: `claude-code-profiler`
-
-Robust one-liner:
+The script ships next to this skill. Use this **single-line** resolver — it always produces a `.../scripts/cc_profiler.py` path, never a bare directory:
 
 ```bash
-SCRIPT="${CLAUDE_PLUGIN_ROOT:+${CLAUDE_PLUGIN_ROOT}/scripts/cc_profiler.py}"
-[ -n "$SCRIPT" ] && [ -f "$SCRIPT" ] || SCRIPT="${CLAUDE_PROJECT_DIR:-$PWD}/scripts/cc_profiler.py"
-[ -f "$SCRIPT" ] || SCRIPT="$(command -v claude-code-profiler || true)"
+SCRIPT="${CLAUDE_PLUGIN_ROOT:-${CLAUDE_PROJECT_DIR:-$PWD}}/scripts/cc_profiler.py"
 ```
+
+`${CLAUDE_PLUGIN_ROOT:-…}` picks the plugin root when running as an installed plugin, falls back to `CLAUDE_PROJECT_DIR` (project-mode skill / repo clone), and finally to `$PWD`. The `/scripts/cc_profiler.py` suffix is unconditional, so the resolved value is always a file path.
+
+**Do not** invent fallbacks like `${SCRIPT:-$CLAUDE_PROJECT_DIR}` or `python3 "$CLAUDE_PROJECT_DIR" …` — those pass a directory to `python3` and produce `can't find '__main__' module in '…'`. If `$SCRIPT` doesn't exist, fail loudly instead of falling back.
 
 ## Subcommands
 
-Map the user's arguments to the script as follows. Pass arguments through verbatim — do not interpret tags or notes yourself.
+Always emit **one** Bash invocation in this exact shape (substitute the subcommand and args). The `[ -f … ]` guard prevents the directory-as-script bug:
 
-| User said | You run |
+```bash
+SCRIPT="${CLAUDE_PLUGIN_ROOT:-${CLAUDE_PROJECT_DIR:-$PWD}}/scripts/cc_profiler.py"
+[ -f "$SCRIPT" ] || { echo "cc_profiler.py not found at $SCRIPT" >&2; exit 1; }
+python3 "$SCRIPT" <subcommand> <args...>
+```
+
+Map the user's arguments to `<subcommand> <args...>`. Pass arguments through verbatim — do not interpret tags or notes yourself.
+
+| User said | `<subcommand> <args...>` |
 |---|---|
-| `/profile start [name] [--tag k=v]... [--note "..."]` | `python3 SCRIPT start [name] [--tag k=v]... [--note "..."]` |
-| `/profile status` | `python3 SCRIPT status` |
-| `/profile mark <label>` | `python3 SCRIPT mark <label>` |
-| `/profile stop [--format=...] [--export DIR]` | `python3 SCRIPT stop [--format=...] [--export DIR]` |
-| `/profile reset` | `python3 SCRIPT reset` |
-| `/profile` (no args) | `python3 SCRIPT status` (treat as status) |
+| `/profile start [name] [--tag k=v]... [--note "..."]` | `start [name] [--tag k=v]... [--note "..."]` |
+| `/profile status` | `status` |
+| `/profile mark <label>` | `mark <label>` |
+| `/profile stop [--format=...] [--export DIR]` | `stop [--format=...] [--export DIR]` |
+| `/profile reset` | `reset` |
+| `/profile` (no args) | `status` (treat as status) |
 
-If the subcommand is unrecognized, run `python3 SCRIPT --help` and show the usage.
+If the subcommand is unrecognized, replace the last line with `python3 "$SCRIPT" --help` and show the usage.
 
 ## What the profiler does
 
