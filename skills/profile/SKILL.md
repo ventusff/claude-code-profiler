@@ -11,23 +11,31 @@ The user is invoking the profiler. Read the user's argument list, then run **exa
 
 ## Resolving the script path
 
-The script ships next to this skill. Use this **single-line** resolver — it always produces a `.../scripts/cc_profiler.py` path, never a bare directory:
+**Important — read this carefully, do not improvise.**
+
+`${CLAUDE_PLUGIN_ROOT}` is **not reliably injected** into the bash commands you emit from this skill. We learned this the hard way: writing `${CLAUDE_PLUGIN_ROOT:-…}` collapses to the fallback because the variable is empty at bash-execution time, and the fallback then mis-resolves to a directory. Do **not** reference `CLAUDE_PLUGIN_ROOT` here.
+
+Instead, locate the script by globbing the plugin cache (where Claude Code installs the plugin) and falling back to the dev repo. Use this exact 3-line block — copy it verbatim, do not rewrite:
 
 ```bash
-SCRIPT="${CLAUDE_PLUGIN_ROOT:-${CLAUDE_PROJECT_DIR:-$PWD}}/scripts/cc_profiler.py"
+SCRIPT="$(ls -1d ~/.claude/plugins/cache/*/claude-code-profiler/*/scripts/cc_profiler.py 2>/dev/null | sort -V | tail -1)"
+[ -n "$SCRIPT" ] || SCRIPT="${CLAUDE_PROJECT_DIR:-$PWD}/scripts/cc_profiler.py"
+[ -f "$SCRIPT" ] || { echo "cc_profiler.py not found at '$SCRIPT'. Install the plugin or run from the repo." >&2; exit 1; }
 ```
 
-`${CLAUDE_PLUGIN_ROOT:-…}` picks the plugin root when running as an installed plugin, falls back to `CLAUDE_PROJECT_DIR` (project-mode skill / repo clone), and finally to `$PWD`. The `/scripts/cc_profiler.py` suffix is unconditional, so the resolved value is always a file path.
-
-**Do not** invent fallbacks like `${SCRIPT:-$CLAUDE_PROJECT_DIR}` or `python3 "$CLAUDE_PROJECT_DIR" …` — those pass a directory to `python3` and produce `can't find '__main__' module in '…'`. If `$SCRIPT` doesn't exist, fail loudly instead of falling back.
+How it resolves:
+1. **Plugin install (preferred)** — glob picks the highest-versioned `cc_profiler.py` under `~/.claude/plugins/cache/<marketplace>/claude-code-profiler/<version>/scripts/`. `sort -V | tail -1` ensures we always run the newest installed version, ignoring stale older versions kept around during the update grace window.
+2. **Dev mode fallback** — if no plugin install is found, use `$CLAUDE_PROJECT_DIR/scripts/cc_profiler.py` (or `$PWD` if neither var is set). This is for working directly inside a clone of the source repo.
+3. **Fail-fast** — if neither path resolves to a real file, exit 1 with a clear message. **Never** fall through to `python3 "$CLAUDE_PROJECT_DIR" …` or any other variable that holds a directory; that produces `can't find '__main__' module in '…'`.
 
 ## Subcommands
 
-Always emit **one** Bash invocation in this exact shape (substitute the subcommand and args). The `[ -f … ]` guard prevents the directory-as-script bug:
+Always emit **one** Bash invocation in this exact shape — the resolver block followed by the python call. Do not edit the resolver:
 
 ```bash
-SCRIPT="${CLAUDE_PLUGIN_ROOT:-${CLAUDE_PROJECT_DIR:-$PWD}}/scripts/cc_profiler.py"
-[ -f "$SCRIPT" ] || { echo "cc_profiler.py not found at $SCRIPT" >&2; exit 1; }
+SCRIPT="$(ls -1d ~/.claude/plugins/cache/*/claude-code-profiler/*/scripts/cc_profiler.py 2>/dev/null | sort -V | tail -1)"
+[ -n "$SCRIPT" ] || SCRIPT="${CLAUDE_PROJECT_DIR:-$PWD}/scripts/cc_profiler.py"
+[ -f "$SCRIPT" ] || { echo "cc_profiler.py not found at '$SCRIPT'. Install the plugin or run from the repo." >&2; exit 1; }
 python3 "$SCRIPT" <subcommand> <args...>
 ```
 
