@@ -10,7 +10,7 @@
       "name": "claude-code-profiler",
       "source": "./",
       "description": "Profile a Claude Code session window — wall time, API time, tool time, token cost, per-bucket breakdowns.",
-      "version": "0.2.1",
+      "version": "0.2.2",
       "author": {
         "name": "Jianfei Guo",
         "email": "ffventus@gmail.com"

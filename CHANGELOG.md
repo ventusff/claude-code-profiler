@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.2
+
+### Changed — terminology
+- **"window" → "profile"** in all user-facing prose and CLI output strings.
+  "Profile" is the standard term in profiler tooling (cProfile, Go pprof, Linux
+  `perf`) and lines up with the slash command (`/profile`), the tool name, and
+  the artifact files (`profile.json`, `profile.md`). Status output now reads
+  `no active profile.` instead of `no active window.`; equivalent rewording in
+  every other CLI message and `--help` line.
+- Internal data structure / on-disk contract unchanged: `state.json` and
+  `profile.json` still carry `window_id` / `window_dir` fields, the artifact
+  parent directory is still `windows/<id>/`, and the test fixture is still
+  named `built_window`. Renaming those would break state written by 0.1.x and
+  0.2.0/0.2.1 installs; the README footnote in the Output artifacts section
+  flags this divergence.
+
+### Changed — docs
+- Major README rewrite (English + Chinese) from "How it works" onwards. The
+  new "How it works" section explains where Claude Code stores parent +
+  subagent transcripts on disk, what each metric is and how it's aggregated,
+  and the two correctness rules (`(source, agent_id, message.id)` dedup;
+  Agent/Skill/Task bundle-wall suppression) that keep totals honest. New
+  "Reading the report" subsection demystifies non-obvious labels (`tool time
+  sum` vs `wall`, `(main)`/`(subagent)` rows, `agents=N calls=N`). New "Tests"
+  section. Limitations refreshed (overlap-induced time over-count, 1h-cache
+  cost approximation). Roadmap rewritten as current / next / later.
+- Stale "Only one active ... per machine at a time" guidance corrected to
+  per-Claude-Code-session, with the regression-test reference.
+- README_cn.md fully resynced — same 13 sections, same example output (with
+  0.2.0 fields), same terminology callout.
+
+### Fixed
+- One test assertion in `tests/test_concurrent_sessions.py` updated to match
+  the new CLI string (`"no active profile"`).
+
 ## 0.2.1
 
 ### Fixed

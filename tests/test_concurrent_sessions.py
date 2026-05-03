@@ -110,7 +110,7 @@ def test_reset_isolated_per_session(env_factory, run_cli):
     assert rA.returncode == 0, rA.stderr
 
     sA = _status(run_cli, env_a).stdout
-    assert "no active window" in sA.lower()
+    assert "no active profile" in sA.lower()
 
     sB = _status(run_cli, env_b).stdout
     assert "winB" in sB, f"reset on A should not touch B. B status: {sB}"

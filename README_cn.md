@@ -2,9 +2,9 @@
 
 [English](README.md) | **中文**
 
-> 为 Claude Code 会话切一段窗口，量出墙钟时间、API 时间、工具时间、Token 成本，以及按桶（docker pull / build、数据集下载、checkpoint 下载、benchmark、test……）拆出的细粒度耗时。
+> 在 Claude Code 会话里 profile 一段时间，量出墙钟时间、API 时间、工具时间、Token 成本，以及按桶（docker pull / build、数据集下载、checkpoint 下载、benchmark、test……）拆出的细粒度耗时。
 
-`/profile start` 起一个窗口，做事，`/profile stop` 出报告。纯 Python 标准库实现，单文件脚本；不需要 OpenTelemetry，不需要后台守护进程，不需要改 Claude Code 任何配置。
+`/profile start` 起一个 profile，做事，`/profile stop` 出报告。纯 Python 标准库实现，单文件脚本；不需要 OpenTelemetry，不需要后台守护进程，不需要改 Claude Code 任何配置。
 
 适合：
 - 想知道一段调试 / 跑 benchmark 到底慢在哪儿（API？工具？docker pull？）
@@ -16,12 +16,14 @@
 ## 用法 —— 就三行
 
 ```
-/profile start             # 开一个 profile 窗口
-…像平常一样跟 Claude 对话:跑 benchmark、调试、跑工具,怎么用都行…
-/profile stop              # 关窗口、出报告
+/profile start             # 开始一个 profile
+…像平常一样跟 Claude 对话：跑 benchmark、调试、跑工具，怎么用都行…
+/profile stop              # 结束 profile，出报告
 ```
 
-整个工作流就这三行。**会话中间不用塞额外提示、不用特殊语法、不用"记得记录这个"。**`stop` 时 profiler 自动回头扫一次 transcript,把 `start` ~ `stop` 之间发生过的事情聚合成下面那张表。一个会话里 `start → stop → start → stop …` 想开几次开几次,每次都是独立的 window。
+整个工作流就这三行。**会话中间不用塞额外提示、不用特殊语法、不用"记得记录这个"。** `stop` 时 profiler 自动回头扫一次 transcript，把 `start` ~ `stop` 之间发生过的事情聚合成下面那张表。一个 Claude Code 会话里 `start → stop → start → stop …` 想开几次开几次，每次都是独立的 profile。
+
+整篇 README 里说到 **profile**（名词）就是指这样一段 start→stop 之间的测量。这是 profiler 工具领域的标准用法 —— cProfile、Go pprof、Linux `perf` 都用 "profile" 指这次测量产出的数据，跟我们这里的慢命令（`/profile`）、工具名（`claude-code-profiler`）、产物文件（`profile.json`、`profile.md`）正好对得上。
 
 ---
 
@@ -30,51 +32,62 @@
 一次 `/profile stop` / `profile status` 之后，终端默认输出大致长这样：
 
 ```
-╭─ profile: bench-run [b214a5be]  18m24s wall
-├─ time
-│  wall                  18m24s
-│  api time              4m12s
-│  tool time sum         13m51s
-│  tool time wall        12m38s   (critical path; sum > wall = parallel)
-│  user-thinking            42s
-│  idle/wait                52s
-├─ api time by model
-│  claude-opus-4-7        3m48s
-│  claude-sonnet-4-6        24s
-├─ tool time by bucket
-│  docker_pull            6m11s
-│  benchmark_run          4m02s
-│  bash                   1m38s
-│  coding                 1m20s
-│  test                     40s
-├─ top tools  (exact = solo bundle, ~ = N-way parallel split)
-│  Bash               9m51s   n=37  ok=35  fail=2
-│  Read               1m12s   n=58  ok=58  fail=0  (~12/58)
-│  Edit                 48s   n=11  ok=11  fail=0
-│  Write                21s   n=4   ok=4   fail=0
-│  Agent              1m02s   n=2   ok=2   fail=0
-├─ tokens
-│  input              1.2M
-│  output             38.4k
-│  cache write        420.1k
-│  cache read         8.30M
-│  tool result (est)  612.0k
-├─ cost
-│  estimated         $   3.8412  (not billing truth)
-├─ turns / errors
-│  assistant turns           94
-│    debug (w/tool)          71
-│    sidechain                4
-│  user prompts              12
-│  tool calls               118
-│  subagent calls             2
-│  api errors                 0
-│  retries                    0
-│  compactions                1
-│    pre-tokens         158.2k
-│    post-tokens         38.4k
-│  lines +312 / -88
-╰─ artifacts under: /home/you/.local/state/claude-code-profiler/windows/20260430T163913Z__bench__d717a1
+ ╭─ profile: run [60943b15]  51m34s wall
+ ├─ time
+ │  wall                  51m34s
+ │  api time              15m21s
+ │  tool time sum         13m24s
+ │  tool time wall        13m24s  (critical path; sum > wall = parallel)
+ │  user-thinking          30.1s
+ │  idle/wait             22m12s
+ ├─ api time by model
+ │  claude-opus-4-7                  10m22s
+ │  claude-sonnet-4-6                 4m59s
+ │  (main)                            28.6s
+ │  (subagent)                       14m53s
+ ├─ tool time by bucket
+ │  bash                              5m47s
+ │  benchmark_run                     4m26s
+ │  coding                            2m12s
+ │  test                              58.0s
+ │  mcp                                0.4s
+ ├─ top tools  (exact = solo bundle, ~ = N-way parallel split)
+ │  Bash                 11m12s  n=85  ok=79  fail=6 (~17/85)
+ │  Write                 1m35s  n=10  ok=9  fail=1
+ │  Edit                  20.3s  n=9  ok=9  fail=0
+ │  Read                  16.6s  n=38  ok=38  fail=0 (~11/38)
+ │  mcp__plugin_nautilus_nautilus__lookup_benchmark     0.2s  n=1  ok=1  fail=0 (~1/1)
+ ├─ tokens
+ │  input                    147
+ │  output                 26.4k
+ │  cache write           201.1k  (5m=188.3k, 1h=12.9k)
+ │  cache read             8.37M  (hit_ratio=0.98)
+ │  thinking blocks            3  (0 tok est)
+ │  tool result (est)      69.5k
+ ├─ tokens / cost by source
+ │  subagent   $ 13.4388  in=137  out=22.9k  cw=188.3k  cr=8.20M  calls=130
+ │  main       $  1.0098  in=10  out=3.6k  cw=12.9k  cr=173.2k  calls=5
+ ├─ tokens / cost by model
+ │  claude-opus-4-7              $ 13.4222  in=96  out=20.8k  calls=86
+ │  claude-sonnet-4-6            $  1.0264  in=51  out=5.6k  calls=49
+ ├─ subagents (2 files)
+ │  nautilus:policy-generator    $ 12.4124  in=86  out=17.2k  agents=1  calls=81
+ │  nautilus:env-generator       $  1.0264  in=51  out=5.6k  agents=1  calls=49
+ ├─ cost
+ │  estimated         $  14.4486  (not billing truth)
+ ├─ turns / errors
+ │  assistant turns          135
+ │    debug (w/tool)         131
+ │    sidechain              130
+ │  user prompts               6
+ │  tool calls               146
+ │  subagent calls             2  (2 agent files)
+ │  api errors                 0
+ │  retries                    0
+ │  compactions                0
+ │  stop reasons     tool_use=60, end_turn=4
+ │  lines +885 / -39
+ ╰─ artifacts under: /home/ventus/.local/state/claude-code-profiler/windows/20260503T112904Z__run__5162f
 ```
 
 同一份数据还能用 `--format markdown` 出可粘贴到 issue 的 Markdown 表格，或者 `--format json` 出完整结构化字段。
@@ -114,7 +127,7 @@ claude plugin install claude-code-profiler@claude-code-profiler
 claude plugin list
 ```
 
-能看到 `claude-code-profiler` 即装好。重新打开（或新开）一个 Claude Code 会话，输入 `/profile`，应当看到 `claude-code-profiler: no active window.`。
+能看到 `claude-code-profiler` 即装好。重新打开（或新开）一个 Claude Code 会话，输入 `/profile`，应当看到 `claude-code-profiler: no active profile.`。
 
 之后的日常用法：
 
@@ -166,41 +179,75 @@ python3 scripts/cc_profiler.py stop --format table
 
 | 命令 | 行为 |
 |---|---|
-| `start [name] [--tag k=v]... [--note "..."]` | 开一个窗口。落盘 session_id、transcript 路径、cwd、git sha & dirty、`CLAUDE_*/ANTHROPIC_*/OTEL_*` 环境快照、当前模型。已存在活跃窗口时拒绝。 |
-| `status` | 看活跃窗口已经累计了多少时间、几条 turn。 |
-| `mark <label>` | 在当前窗口里追加一个带时间戳的标签（"docker pull starts here"、"benchmark begins"），出报告时一起输出。 |
+| `start [name] [--tag k=v]... [--note "..."]` | 开启一个新 profile。落盘 session_id、transcript 路径、cwd、git sha & dirty、`CLAUDE_*/ANTHROPIC_*/OTEL_*` 环境快照、当前模型。本会话已有活跃 profile 时拒绝。 |
+| `status` | 看活跃 profile 已经累计了多长时间、几条 turn。 |
+| `mark <label>` | 在当前 profile 里追加一个带时间戳的标签（"docker pull starts here"、"benchmark begins"），出报告时一起输出。 |
 | `stop [--format=table\|markdown\|json] [--export DIR]` | 扫描 transcript [start_ts, now]，算指标，渲染报告，落盘 artifacts，清掉活跃指针。 |
-| `reset` | 不出报告，直接丢掉活跃窗口指针。 |
+| `reset` | 不出报告，直接丢掉活跃 profile 指针。 |
 
-每台机器同时只允许一个活跃窗口（v0 的有意约束；并发窗口在 v1）。一个 session 里可以开-停-再开-停多次，每次都是独立 window。
+每个 Claude Code 会话同时只允许一个活跃 profile。活跃 profile 指针是按 session 隔离的 —— 同一台机器上并发的多个 Claude Code 会话各有自己的指针，互不干扰（在 `tests/test_concurrent_sessions.py` 里有回归测试）。一个会话内 `start → stop → start → stop …` 没问题，同一个会话里同时开两个 profile 不行。
 
 ---
 
 ## 它怎么工作
 
-Claude Code 把每条会话写到 `~/.claude/projects/<slug>/<session_id>.jsonl` —— `cc_profiler.py` 在 `start` 时记下 session 和起始时间戳，`stop` 时回头扫这段时间区间里的 JSONL 行，按事件类型聚合：
+### Claude Code 怎么存一个会话
 
-- **API 时间** = 上一条 `user` / tool_result → 下一条 `assistant` 的间隔，按 turn 的 `message.model` 分桶；
-- **工具时间** = 父 `assistant` 消息 → 该批次最后一个 `tool_result` 的墙钟差（"bundle wall"），按工具名 + 命令分类（Bash 走正则，分到 `docker_pull / docker_build / dataset_dl / checkpoint_dl / benchmark_run / test / infra / download / bash`）；
-- **Token 与成本** = 每条 assistant turn 的 `usage` × 该 turn 实际 `message.model` 对应的价格。多模型混跑时按 turn 算，不是按整段平均；
-- **Compaction、retry、API error、subagent、idle/wait** 都是从 transcript 标记里识别。
+Claude Code 把每条会话以 JSONL 写在 `~/.claude/projects/<slug>/` 下：
 
-完整指标列表见 `notes/plan.md` 里的 "Metric definitions" 一节。
+```
+<slug>/
+├── <session_id>.jsonl              # 父对话（isSidechain: false）
+└── <session_id>/
+    └── subagents/
+        ├── agent-<aid>.jsonl       # 每次 Task 工具派发的子 agent 一份
+        ├── agent-<aid>.meta.json   #   带 `agentType`、`description`
+        └── …
+```
+
+子 agent **从不被合并到父文件里** —— 它们各自有自己的 JSONL，行带 `isSidechain: true`。只扫父文件（写起来最自然、大多数自制分析脚本就是这么干的）会静默地漏掉子 agent 的全部活动。我们实测的一次真实会话：父文件单独算是 \$5.93；父 + 3 个子 agent 文件合起来是 \$14.27，2.4× 的低估。详见 `notes/subagent-coverage.md`。
+
+`/profile stop` 会同时走父文件**和它所有的同级子 agent 文件**，按时间戳合并排序，再聚合成下面这些指标。
+
+### 聚合了哪些东西
+
+- **Token 与成本** —— 每条 assistant 行的 `usage` block，按该 turn 实际 `message.model` 计价。多模型混跑（Opus + Sonnet，或主线用 Opus、子 agent 用 Haiku）按 turn 计费、不取平均。按 source / 按 model / 按 `agentType` 拆出的小账目加起来正好等于总数。
+- **API 时间** —— 上一条 user / tool_result / compaction 行 → 下一条 assistant 行的间隔。按 source 拆成 `main` / `subagent`，再按 `message.model` 切一份。
+- **工具时间** —— 父 assistant 消息 → 该批次最后一个 `tool_result` 的墙钟差（"bundle wall"）。按工具名分桶；Bash 命令走正则分到 `docker_pull` / `docker_build` / `dataset_dl` / `checkpoint_dl` / `benchmark_run` / `test` / `infra` / `download` / `bash`。同样有 `(main, subagent)` 拆分。
+- **缓存** —— `cache_creation_input_tokens` 报总量，**同时**从 `usage.cache_creation` 拆出 5m vs 1h TTL 部分；再加一个 `cache_hit_ratio = cache_read / (input + cache_creation + cache_read)`，让你一眼看出 prompt caching 划不划算。
+- **其他计数器** —— `thinking` block（extended-thinking 输出）、`usage.server_tool_use` 里的 Anthropic 侧 `web_search` / `web_fetch`、`stop_reason` 分布、retries（重复的 `requestId`）、API 错误（`stop_reason ∈ {error, refusal}`）、compaction（`type: summary` / `subtype: compact*`）、以及从 Edit / Write / MultiEdit 输入推算出的代码增删行数。
+
+### 让总数靠谱的两条规则
+
+**按 `(source, agent_id, message.id)` 去重。** Anthropic 的 SDK [文档明确说](https://code.claude.com/docs/en/agent-sdk/cost-tracking) 一个逻辑上的 assistant turn 可能被流式拆成多条 JSONL 行（每个 content block 一行 —— 文本、思考、并行 tool_use），共享同一个 `message.id` 和同一个 `usage` block。按行直接相加会把 token 算膨胀 2-6×。profiler 按 `(源文件, agent_id, message.id)` 三元组合并，所以这套去重也兜得住任何跨文件的 id 撞车。
+
+**抑制父文件里 Agent / Skill / Task tool_use 的 bundle wall。** 父文件里一次 Task 工具的 bundle wall 等于*整个* 子 agent 的运行时间（从外面看就是这样）。子 agent 文件本身的 per-turn `api_time` + per-bundle 工具时间已经覆盖了那段间隔 —— 两边都加一遍就是双计。当子 agent 文件存在时，父侧的 Agent bundle 还会被记 COUNT（保证 `subagent calls` 是对的），但时间贡献清零。这条规则递归生效：嵌套子 agent 同样落到那个扁平的 `subagents/` 目录里，处理方式一致。
+
+token 那一侧没有时间双计的对应风险：每行 transcript 是一次独立的 API 调用，自带独立 `usage`，跨文件相加就是精确加法。
+
+### 报告字段怎么读
+
+有几个字段不看说明不太直观：
+
+- `tool time sum` vs `tool time wall` —— `sum` 是按桶累加 bundle wall；`wall` 是按不同父消息算的关键路径之和。transcript-only 模式下两者重合（没有 per-tool 起止可以区分）；接上 hook 之后才会分开。
+- `api time by model` 下面的 `(main)` / `(subagent)` 行，是把上面 model 维度的总数按 source 文件拆。model 行和 source 行切的是同一个总数，不是相加关系。
+- `tokens / cost by agent type` —— `agents=N` 是属于这个 type 的不同 `agent-<aid>.jsonl` 文件数；`calls=N` 是这些文件里的 API 调用次数。`agents=2 calls=100` 表示两次独立派发，每次大约 turn 了 50 来轮。
+- `subagent calls (N agent files)` —— 括号里是合并进来的 `agent-*.jsonl` 文件数。如果是 0 但你预期有子 agent，那就是发现机制没看到 —— 去 `~/.claude/projects/<slug>/<session_id>/subagents/` 里看看。
 
 ### 并行工具调用的精度限制
 
-如果一个 assistant 消息里同时发了 N 个 `tool_use`（典型场景：并发跑 Read），Anthropic 的协议要求所有 tool_result 一起返回，所以它们在 transcript 里会**共享同一个 `user` 行的时间戳**。这意味着：
+如果一个 assistant 消息里同时发了 N 个 `tool_use`（典型场景：并发跑 Read），Anthropic 的协议要求所有 tool_result 一起返回，所以它们在 transcript 里**共享同一个 `user` 行的时间戳**：
 
 - **N=1**（独跑工具）：单工具耗时 = 这个 bundle 的 wall 时间，**精确**。
 - **N>1**（并行 bundle）：单工具耗时只能近似为 `bundle_wall / N`，profile 里这些会被标 `~`，并在 `tool_approx_count_by_tool` 里累计。
 
-想拿到**真实**的并行单工具起止时间，唯一办法是装 PreToolUse / PostToolUse hook（见下文）。
+想拿到**真实**的并行单工具起止时间，唯一办法是装 PreToolUse / PostToolUse hook —— 见下文。
 
 ---
 
-## 可选：用 hook 拿到精确单工具时间
+## 可选：用 hook 拿到精确的单工具时间
 
-把下面这段写进 `.claude/settings.json`（项目级或用户级）就能让 profiler 同时吃 hook 事件，覆盖 transcript 的近似值。已用插件方式安装的话，路径用 `${CLAUDE_PLUGIN_ROOT}`：
+把下面这段写进 `.claude/settings.json`（项目级或用户级）就能让 profiler 同时吃 hook 事件，覆盖并行 bundle 的近似值：
 
 ```json
 {
@@ -214,51 +261,70 @@ Claude Code 把每条会话写到 `~/.claude/projects/<slug>/<session_id>.jsonl`
 }
 ```
 
-如果是 git clone 直接当脚本跑，把 `${CLAUDE_PLUGIN_ROOT}` 换成 `${CLAUDE_PROJECT_DIR}` 或仓库绝对路径即可。
+`${CLAUDE_PLUGIN_ROOT}` 在用插件方式装好之后会自动解析。如果你是直接 git clone 当脚本跑，把它换成 `${CLAUDE_PROJECT_DIR}` 或仓库绝对路径即可。
 
-每个 hook 拿到 Claude 推过来的 JSON payload，写一行进当前活跃 window 的 `events.from_hooks.jsonl`。**没活跃 window 时所有 hook 静默退出**，不会污染你正常的会话。
+每个 hook 拿到 Claude 推过来的 JSON payload，写一行进当前活跃 profile 的 `events.from_hooks.jsonl`。**没活跃 profile 时所有 hook 静默退出**，不会污染你正常的会话，所以可以放心一直挂着。
 
 ---
 
 ## 输出 artifacts
 
-每次 `stop` 后会在 `$XDG_STATE_HOME/claude-code-profiler/windows/<window_id>/`（默认 `~/.local/state/claude-code-profiler/windows/<window_id>/`）下落：
+每次 `stop` 后会在 `$XDG_STATE_HOME/claude-code-profiler/windows/<profile_id>/`（默认 `~/.local/state/claude-code-profiler/windows/<profile_id>/`）下落：
 
 ```
-profile.json              # 完整结构化报告，含所有指标和 per-turn 拆分
+profile.json              # 完整结构化报告，含所有指标和拆分维度，按 key 排序
 profile.md                # 可粘贴到 issue / PR 的 Markdown 报告
-events.jsonl              # 标准化事件流（turn_start / tool_start / mark / compaction / error / …）
-transcript.snippet.jsonl  # 这段窗口里 transcript 的原始行（用于回放 / 复算）
+events.jsonl              # 标准化事件流（turn_end / tool_end / mark / compaction / …）
+transcript.snippet.jsonl  # 这段 profile 区间里 transcript 的原始行（用于回放 / 复算）
 state.json                # start 时冻结的元数据（git sha、env 快照、起始 ts）
+events.from_hooks.jsonl   # hook 事件（只有挂了 hook 才会有）
 ```
 
-`stop --export DIR` 会把整组 artifacts 同时拷一份到 `DIR/<window_id>/`，方便归档进 benchmark run 目录。
+`profile.json` 是真值源 —— 表格和 markdown 里露出的字段都来自它，外加几个一屏放不下的（`tool_time_by_bucket_by_source_s`、`api_call_count_by_source`、`tokens_cost_by_agent_type`，等等）。
+
+`stop --export DIR` 会把整组 artifacts 同时拷一份到 `DIR/<profile_id>/`，方便归档进 benchmark run 目录。
+
+> 这个外层目录之所以叫 `windows/`，是为了兼容 0.1.x 写下来的状态文件；`state.json` 和 `profile.json` 里的 `window_id` / `window_dir` 字段名也是同样原因留着。文档行文里我们用 "profile"，但不打算破坏这层 on-disk 契约。
 
 ---
 
 ## 价格表
 
-内置一份 2026-04 的 USD/百万 token 价格表，覆盖 Opus 4 / 4.7、Sonnet 4 / 4.5 / 4.6、Haiku 3.5 / 4.5。匹配规则是 `model.startswith(prefix)`，没匹中的模型 cost 报 `null` 并在终端打 warning。
+内置一份 2026-04 的 USD/百万 token 价格表，覆盖 Opus 4 / 4.7、Sonnet 4 / 4.5 / 4.6、Haiku 3.5 / 4.5。匹配规则是 `model.startswith(prefix)`，没匹中的模型 cost 报 `null`，并把模型 id 放进 `cost_uncovered_models`，让你能看到漏了哪个。
 
 ```
 claude-opus-4-7  : (input 15.00, output 75.00, cache_write_5m 18.75, cache_read 1.50)
-claude-sonnet-4-6: ( 3.00, 15.00, 3.75, 0.30)
-claude-haiku-4-5 : ( 1.00,  5.00, 1.25, 0.10)
+claude-sonnet-4-6: ( 3.00, 15.00,  3.75, 0.30)
+claude-haiku-4-5 : ( 1.00,  5.00,  1.25, 0.10)
 …
 ```
 
-`stop --prices "opus:15,75,18.75,1.5;sonnet:3,15,3.75,0.3"` 可在线覆盖。1h 缓存写按 5m 价的 2× 计。
+`stop --prices "opus:15,75,18.75,1.5;sonnet:3,15,3.75,0.3"` 可在线覆盖。1h 缓存写（`cache_creation.ephemeral_1h_input_tokens`）按 5m 价的 2× 计，存在时自动应用。
 
-> ⚠ 这是**估算**，不是 Anthropic 计费源。用作"哪一段烧得多 / 不同模型对比"够用，不要用作账单依据。
+> ⚠ 这是**估算**，不是 Anthropic 计费源。用作"哪一段烧得多 / 不同模型对比"够用，不要拿去开发票。账单真值要看 [Claude Console 的 Usage 页](https://platform.claude.com/usage)。
 
 ---
 
 ## 已知限制
 
-- **OTel 不支持**（v0 主动放弃）。如果你已经在跑带 OTel 的 Claude Code，profiler 不会读 OTel；之后 v1 会加。
-- **transcript 之外的耗时算不进去**：用户离开终端去喝咖啡的 5 分钟会被算成 `idle/wait`（默认阈值 300s 之上的 user 侧 gap）。
-- **并行工具的单工具耗时**：transcript-only 模式下是近似（见上文）。要精确请装 hook。
-- **同一时刻只能开一个窗口**。
+- **不读 OTel**（这是当前版本主动放弃的）。如果你已经在跑带 OpenTelemetry 的 Claude Code，profiler 直接忽略它。OTel 摄入是后续版本的候选项，主要用途是把 `claude_code.token.usage` 上的 `query_source`（main / subagent / auxiliary）属性拿来跟"按文件归源"做交叉校验。
+- **transcript 之外的耗时算不进去。** 用户离开终端去喝咖啡的 5 分钟会被算成 `idle/wait`（默认阈值 300s 之上的 user 侧 gap）。profiler 没法区分你是真在喝咖啡、还是在仔细看一份长 plan。
+- **并行 bundle 的单工具耗时**在 transcript-only 模式下是近似（`bundle_wall / N`）。要精确请装 hook —— 总数不受影响。
+- **父和子 agent 活动有近距离重叠时，时间会略有膨胀。** 实测里 `api_time + tool_time + idle` 与 `wall` 的差值在 5-10% 量级。token 和成本不受影响 —— 那是 per-API-call 的累加，不是 gap 测量。
+- **1h 缓存写 token 不是按 model 拆的。** 2× 加价是按各 model 占总 `cache_creation_input_tokens` 的比例分摊回去。只有一个 model 写 1h 缓存（常见情形）时是精确的，否则是近似。
+- **每个 Claude Code 会话同时只能一个活跃 profile。** 同一台机器上并发的多个 Claude Code 会话各有自己的活跃 profile 指针（在 `tests/test_concurrent_sessions.py` 里有回归测试）；一个会话里 `start → stop → start → stop …` 没问题，同一个会话里同时开两个就不行。
+
+---
+
+## 测试
+
+```bash
+uv run pytest                                          # 全跑
+uv run pytest tests/test_turn_counting.py -v           # 子 agent / 去重 / 计数器回归
+uv run pytest tests/test_concurrent_sessions.py -v     # 跨会话的活跃指针隔离
+```
+
+`tests/_synth.py` 用来构造合成 JSONL transcript（父 + 子 agent 文件；text、tool_use、流式分片这几种 row 类型），让单个聚合行为可以脱离活跃 Claude Code 会话被锁定下来。`tests/conftest.py` 里的 `built_window` fixture（名字沿用了老的 on-disk 术语）开启一个 profile，把 `start_ts` 打补丁打成 0，这样测试里指定的过去时间戳就落得进 profile 区间。
 
 ---
 
@@ -271,20 +337,26 @@ claude-code-profiler/
 │   └── marketplace.json        # 单插件 marketplace 清单
 ├── skills/
 │   └── profile/
-│       └── SKILL.md            # /profile 派发器
+│       └── SKILL.md            # /profile 派发器（解析脚本路径，再 exec）
 ├── scripts/
 │   └── cc_profiler.py          # 单文件实现，纯 stdlib
-├── notes/                      # 设计 / 决策记录（gitignored）
-│   └── plan.md
+├── tests/
+│   ├── _synth.py               # 单元测试用的 transcript 构造器
+│   ├── conftest.py             # built_window fixture
+│   ├── test_concurrent_sessions.py
+│   └── test_turn_counting.py
+├── notes/
+│   └── subagent-coverage.md    # 0.2.0 设计笔记（已提交）
+│                               # 其他 notes/*.md 是本地草稿（gitignored）
+├── CHANGELOG.md
 ├── README.md                   # English
-└── README_cn.md                # 中文
+└── README_cn.md                # 中文（本文件）
 ```
 
 ---
 
 ## Roadmap
 
-- **v0**（已可用）：transcript-only，单窗口，五个子命令，table / markdown / json 三种输出，作为合法 Claude Code 插件分发。
-- **v1**：hook 增强（精确单工具耗时）、可选 OTel 摄入、并发窗口、`update-config` 一键装 hook。
-- **v2**：批量 run launcher（移植自 SWE-Skills-Bench-dev）+ 跨 run 聚合（CSV / JSON）。
-- **v3**：Web/HTML 报告（如果有人需要）。
+- **0.2.x（当前版本）** —— transcript-only，子 agent 全覆盖，token 总数去重正确，按 source / 按 model / 按 `agentType` 拆分，更细粒度的 Bash 分类，外加一套回归测试。作为 Claude Code 插件经由内置的单插件 marketplace 分发。
+- **下一阶段** —— hook 默认接好（这样并行 bundle 也能拿到精确的单工具耗时）、`CLAUDE_CODE_ENABLE_TELEMETRY=1` 时可选摄入 OTel、单 Claude Code 会话内允许并发 profile、再加一个 `update-config` skill 帮你一键挂 hook。
+- **再之后** —— 批量 run launcher + 跨 run 聚合（CSV / JSON）方便 benchmark 工作流；HTML 报告。

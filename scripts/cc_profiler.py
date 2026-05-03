@@ -1408,7 +1408,7 @@ def render_markdown(rep: dict) -> str:
 
 def cmd_start(args) -> int:
     if load_active() is not None:
-        sys.stderr.write("claude-code-profiler: a window is already active. "
+        sys.stderr.write("claude-code-profiler: a profile is already active. "
                          "Use `claude-code-profiler stop` or `claude-code-profiler reset` first.\n")
         return 1
 
@@ -1471,7 +1471,7 @@ def cmd_start(args) -> int:
 def cmd_status(args) -> int:
     state = load_active()
     if state is None:
-        print("claude-code-profiler: no active window.")
+        print("claude-code-profiler: no active profile.")
         return 0
     elapsed = time.time() - state["start_ts"]
     print(f"claude-code-profiler: active '{state['name']}' [{state['window_id']}]")
@@ -1501,7 +1501,7 @@ def cmd_status(args) -> int:
 def cmd_mark(args) -> int:
     state = load_active()
     if state is None:
-        sys.stderr.write("claude-code-profiler: no active window. Run `claude-code-profiler start` first.\n")
+        sys.stderr.write("claude-code-profiler: no active profile. Run `claude-code-profiler start` first.\n")
         return 1
     label = args.label or ""
     state.setdefault("marks", []).append({"ts": time.time(), "label": label})
@@ -1515,7 +1515,7 @@ def cmd_mark(args) -> int:
 def cmd_stop(args) -> int:
     state = load_active()
     if state is None:
-        sys.stderr.write("claude-code-profiler: no active window.\n")
+        sys.stderr.write("claude-code-profiler: no active profile.\n")
         return 1
 
     end_ts = time.time()
@@ -1581,9 +1581,9 @@ def cmd_stop(args) -> int:
 def cmd_reset(args) -> int:
     state = load_active()
     if state is None:
-        print("claude-code-profiler: no active window to reset.")
+        print("claude-code-profiler: no active profile to reset.")
         return 0
-    print(f"claude-code-profiler: discarded active window '{state['name']}' [{state['window_id']}]")
+    print(f"claude-code-profiler: discarded active profile '{state['name']}' [{state['window_id']}]")
     print(f"  artifacts at {state['window_dir']} are kept (delete manually if not needed)")
     clear_active()
     return 0
@@ -1617,32 +1617,33 @@ def cmd_hook(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="claude-code-profiler", description="Profile a Claude Code session window.")
+        prog="claude-code-profiler",
+        description="Profile a slice of a Claude Code session.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("start", help="Begin a profiling window")
+    sp = sub.add_parser("start", help="Begin a profile")
     sp.add_argument("name", nargs="?", default=None)
     sp.add_argument("--tag", action="append", default=[],
                     help="key=value tag; repeatable")
     sp.add_argument("--note", default=None)
     sp.set_defaults(func=cmd_start)
 
-    sp = sub.add_parser("status", help="Show the active window")
+    sp = sub.add_parser("status", help="Show the active profile")
     sp.set_defaults(func=cmd_status)
 
-    sp = sub.add_parser("mark", help="Append a labeled timestamp to the active window")
+    sp = sub.add_parser("mark", help="Append a labeled timestamp to the active profile")
     sp.add_argument("label", nargs="?", default="")
     sp.set_defaults(func=cmd_mark)
 
-    sp = sub.add_parser("stop", help="Stop the active window and emit a report")
+    sp = sub.add_parser("stop", help="Stop the active profile and emit a report")
     sp.add_argument("--format", choices=("table", "markdown", "json"), default="table")
     sp.add_argument("--export", default=None,
-                    help="Copy the window artifacts to this directory after stop")
+                    help="Copy the profile's artifact bundle to this directory after stop")
     sp.add_argument("--prices", default=None,
                     help="Override price table, e.g. 'opus:15,75,18.75,1.5;sonnet:3,15,3.75,0.3'")
     sp.set_defaults(func=cmd_stop)
 
-    sp = sub.add_parser("reset", help="Discard the active window without producing a report")
+    sp = sub.add_parser("reset", help="Discard the active profile without producing a report")
     sp.set_defaults(func=cmd_reset)
 
     sp = sub.add_parser("_hook", help=argparse.SUPPRESS)
