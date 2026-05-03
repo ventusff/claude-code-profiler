@@ -30,51 +30,76 @@ That's the whole workflow. **No extra prompting mid-session, no special syntax t
 A typical `/profile stop` / `profile status` prints something like:
 
 ```
-╭─ profile: bench-run [b214a5be]  18m24s wall
-├─ time
-│  wall                  18m24s
-│  api time              4m12s
-│  tool time sum         13m51s
-│  tool time wall        12m38s   (critical path; sum > wall = parallel)
-│  user-thinking            42s
-│  idle/wait                52s
-├─ api time by model
-│  claude-opus-4-7        3m48s
-│  claude-sonnet-4-6        24s
-├─ tool time by bucket
-│  docker_pull            6m11s
-│  benchmark_run          4m02s
-│  bash                   1m38s
-│  coding                 1m20s
-│  test                     40s
-├─ top tools  (exact = solo bundle, ~ = N-way parallel split)
-│  Bash               9m51s   n=37  ok=35  fail=2
-│  Read               1m12s   n=58  ok=58  fail=0  (~12/58)
-│  Edit                 48s   n=11  ok=11  fail=0
-│  Write                21s   n=4   ok=4   fail=0
-│  Agent              1m02s   n=2   ok=2   fail=0
-├─ tokens
-│  input              1.2M
-│  output             38.4k
-│  cache write        420.1k
-│  cache read         8.30M
-│  tool result (est)  612.0k
-├─ cost
-│  estimated         $   3.8412  (not billing truth)
-├─ turns / errors
-│  assistant turns           94
-│    debug (w/tool)          71
-│    sidechain                4
-│  user prompts              12
-│  tool calls               118
-│  subagent calls             2
-│  api errors                 0
-│  retries                    0
-│  compactions                1
-│    pre-tokens         158.2k
-│    post-tokens         38.4k
-│  lines +312 / -88
-╰─ artifacts under: /home/you/.local/state/claude-code-profiler/windows/20260430T163913Z__bench__d717a1
+ ╭─ profile: run [60943b15]  51m34s wall
+ ├─ time
+ │  wall                  51m34s
+ │  api time              15m21s
+ │  tool time sum         13m24s
+ │  tool time wall        13m24s  (critical path; sum > wall =
+  parallel)
+ │  user-thinking          30.1s
+ │  idle/wait             22m12s
+ ├─ api time by model
+ │  claude-opus-4-7                  10m22s
+ │  claude-sonnet-4-6                 4m59s
+ │  (main)                            28.6s
+ │  (subagent)                       14m53s
+ ├─ tool time by bucket
+ │  bash                              5m47s
+ │  benchmark_run                     4m26s
+ │  coding                            2m12s
+ │  test                              58.0s
+ │  mcp                                0.4s
+ │  checkpoint_dl                      0.0s
+ │  agent_dispatch                     0.0s
+ ├─ top tools  (exact = solo bundle, ~ = N-way parallel split)
+ │  Bash                 11m12s  n=85  ok=79  fail=6 (~17/85)
+ │  Write                 1m35s  n=10  ok=9  fail=1
+ │  Edit                  20.3s  n=9  ok=9  fail=0
+ │  Read                  16.6s  n=38  ok=38  fail=0 (~11/38)
+ │  mcp__plugin_nautilus_nautilus__lookup_benchmark     0.2s
+ n=1  ok=1  fail=0 (~1/1)
+ ├─ tokens
+ │  input                    147
+ │  output                 26.4k
+ │  cache write           201.1k  (5m=188.3k, 1h=12.9k)
+ │  cache read             8.37M  (hit_ratio=0.98)
+ │  thinking blocks            3  (0 tok est)
+ │  tool result (est)      69.5k
+ ├─ tokens / cost by source
+ │  subagent   $ 13.4388  in=137  out=22.9k  cw=188.3k
+ │  mcp__plugin_nautilus_nautilus__lookup_benchmark     0.2s  n=1  ok=1  fail=0 (~1/1)
+ ├─ tokens
+ │  input                    147
+ │  output                 26.4k
+ │  cache write           201.1k  (5m=188.3k, 1h=12.9k)
+ │  cache read             8.37M  (hit_ratio=0.98)
+ │  thinking blocks            3  (0 tok est)
+ │  tool result (est)      69.5k
+ ├─ tokens / cost by source
+ │  subagent   $ 13.4388  in=137  out=22.9k  cw=188.3k  cr=8.20M  calls=130
+ │  main       $  1.0098  in=10  out=3.6k  cw=12.9k  cr=173.2k  calls=5
+ ├─ tokens / cost by model
+ │  claude-opus-4-7              $ 13.4222  in=96  out=20.8k  calls=86
+ │  claude-sonnet-4-6            $  1.0264  in=51  out=5.6k  calls=49
+ ├─ subagents (2 files)
+ │  nautilus:policy-generator    $ 12.4124  in=86  out=17.2k  agents=1  calls=81
+ │  nautilus:env-generator       $  1.0264  in=51  out=5.6k  agents=1  calls=49
+ ├─ cost
+ │  estimated         $  14.4486  (not billing truth)
+ ├─ turns / errors
+ │  assistant turns          135
+ │    debug (w/tool)         131
+ │    sidechain              130
+ │  user prompts               6
+ │  tool calls               146
+ │  subagent calls             2  (2 agent files)
+ │  api errors                 0
+ │  retries                    0
+ │  compactions                0
+ │  stop reasons     tool_use=60, end_turn=4
+ │  lines +885 / -39
+ ╰─ artifacts under: /home/ventus/.local/state/claude-code-profiler/windows/20260503T112904Z__run__5162f
 ```
 
 The same data is also available as `--format markdown` (paste-ready into an issue) or `--format json` (full structured fields).
