@@ -1,5 +1,9 @@
-# Local notes & scratch — not part of the published plugin
-notes/
+# Local notes & scratch — not part of the published plugin.
+# Specific design notes that document a change set are exempted below.
+# Note: must ignore contents (`notes/*`) rather than the directory (`notes/`),
+# otherwise git can't re-include individual files via `!` rules.
+notes/*
+!notes/subagent-coverage.md
 
 # Profiler runtime artifacts (when the profiler is run from this repo)
 runs/

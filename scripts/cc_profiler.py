@@ -315,12 +315,24 @@ def cwd_to_project_slug(cwd: Path) -> str:
 
 
 def discover_transcript(cwd: Path, prefer_session: str | None = None) -> tuple[Path, str] | None:
-    """Find the active transcript JSONL for `cwd`. Returns (path, session_id) or None."""
+    """Find the active parent transcript JSONL for `cwd`. Returns (path, session_id) or None.
+
+    Only matches top-level parent transcripts. Subagent transcripts live one
+    level deeper under `<session_id>/subagents/agent-*.jsonl` and are picked up
+    separately via `discover_subagent_transcripts`.
+    """
     slug = cwd_to_project_slug(cwd)
     project_dir = PROJECTS_DIR / slug
     if not project_dir.is_dir():
         return None
-    candidates = sorted(project_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    # Restrict to project root — without `p.parent == project_dir` glob also
+    # matches subagent jsonls under <session_id>/subagents/, which would let a
+    # large subagent file pose as the parent.
+    candidates = sorted(
+        (p for p in project_dir.glob("*.jsonl") if p.parent == project_dir),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
     if prefer_session:
         for p in candidates:
             if p.stem == prefer_session:
@@ -329,6 +341,36 @@ def discover_transcript(cwd: Path, prefer_session: str | None = None) -> tuple[P
         return None
     p = candidates[0]
     return p, p.stem
+
+
+def discover_subagent_transcripts(parent_path: Path) -> list[tuple[Path, dict]]:
+    """Return [(jsonl_path, meta_dict), ...] for the parent's subagent transcripts.
+
+    Claude Code writes each subagent (Task tool dispatch) to its own JSONL under
+    `<parent_dir>/<parent_stem>/subagents/agent-<id>.jsonl`, with a sibling
+    `agent-<id>.meta.json` carrying `agentType` and `description`. Subagent rows
+    have `isSidechain: true` and never appear in the parent file, so a parent-
+    only scan undercounts cost/time by the size of the subagent work — in
+    measured sessions frequently 3-5x.
+
+    Nested subagents (subagent-of-subagent) end up in the same flat
+    `<top_session>/subagents/` directory, so this glob captures the whole tree
+    without recursion.
+    """
+    sub_dir = parent_path.parent / parent_path.stem / "subagents"
+    if not sub_dir.is_dir():
+        return []
+    out: list[tuple[Path, dict]] = []
+    for jl in sorted(sub_dir.glob("agent-*.jsonl")):
+        meta_path = jl.with_suffix(".meta.json")
+        meta: dict = {}
+        if meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                meta = {}
+        out.append((jl, meta))
+    return out
 
 
 def iter_jsonl(path: Path) -> Iterator[dict]:
@@ -345,6 +387,28 @@ def iter_jsonl(path: Path) -> Iterator[dict]:
                 continue
 
 
+def load_session_rows(parent_path: Path) -> tuple[list[dict], list[tuple[Path, dict]]]:
+    """Read parent + every subagent transcript and tag each row by source file.
+
+    Each row gets a synthetic `_qs_source` ∈ {"main", "subagent"} based on which
+    file it came from. We don't trust the row's own `isSidechain` flag for this
+    — file location is authoritative and survives any future schema drift.
+    Returns (rows, subagent_files_with_meta).
+    """
+    rows: list[dict] = []
+    for r in iter_jsonl(parent_path):
+        r["_qs_source"] = "main"
+        rows.append(r)
+    sub_files = discover_subagent_transcripts(parent_path)
+    for jl, _meta in sub_files:
+        agent_id = jl.stem.removeprefix("agent-")
+        for r in iter_jsonl(jl):
+            r["_qs_source"] = "subagent"
+            r["_qs_agent_id"] = agent_id
+            rows.append(r)
+    return rows, sub_files
+
+
 # ---------------------------------------------------------------------------
 # Aggregator — transcript scan → metrics
 # ---------------------------------------------------------------------------
@@ -355,10 +419,19 @@ class Aggregator:
     end_ts: float
     prices: list
     idle_threshold: float = 300.0  # seconds of user-side gap that count as idle, not "user-thinking"
+    # When True, skip parent-side Agent/Skill bundle wall accumulation — the
+    # subagent transcript files are being walked in the same pass and their
+    # per-turn api_time + per-bundle tool_time already account for that wall.
+    # Adding the parent's Agent bundle on top would double-count time. Set to
+    # False only as a defensive fallback when no subagent files were found.
+    have_subagent_files: bool = True
 
     # Per-bucket time accumulators (seconds)
     bucket_time: dict[str, float] = field(default_factory=dict)
     bucket_count: dict[str, int] = field(default_factory=dict)
+    # Same time again, partitioned by query_source ("main" / "subagent").
+    # Sums to bucket_time per bucket.
+    bucket_time_by_source: dict[str, dict[str, float]] = field(default_factory=dict)
 
     # Tool-level aggregation
     per_tool_time: dict[str, float] = field(default_factory=dict)
@@ -375,9 +448,19 @@ class Aggregator:
     api_time_by_model: dict[str, float] = field(default_factory=dict)
     api_time_by_query_source: dict[str, float] = field(default_factory=dict)  # main/subagent
     api_call_count: int = 0
+    api_call_count_by_source: dict[str, int] = field(default_factory=dict)
     api_error_count: int = 0
     retry_count: int = 0
     seen_request_ids: set[str] = field(default_factory=set)
+    stop_reason_counts: dict[str, int] = field(default_factory=dict)
+
+    # Server-side tools the model invoked (web_search / web_fetch hosted by Anthropic
+    # rather than as Claude Code Bash calls). Surfaced via usage.server_tool_use.
+    server_tool_use_counts: dict[str, int] = field(default_factory=dict)
+    # service_tier seen ("standard" / "priority" / "batch"); affects pricing.
+    service_tier_counts: dict[str, int] = field(default_factory=dict)
+    # speed seen ("standard" / "fast"); fast mode has its own latency profile.
+    speed_counts: dict[str, int] = field(default_factory=dict)
 
     # User/idle
     active_time_user: float = 0.0
@@ -393,10 +476,21 @@ class Aggregator:
     input_tokens: int = 0
     output_tokens: int = 0
     cache_creation_tokens: int = 0
+    cache_creation_5m_tokens: int = 0
+    cache_creation_1h_tokens: int = 0
     cache_read_tokens: int = 0
+    # Tokens spent inside <thinking> blocks the model emitted (extended-thinking).
+    # This is OUTPUT tokens already counted in `output_tokens`; reported as a
+    # breakdown so users can see how much of output was reasoning vs answer.
+    thinking_text_chars: int = 0
+    thinking_blocks: int = 0
     tool_result_tokens_est: int = 0
     cost_usd: float = 0.0
     cost_uncovered_models: set[str] = field(default_factory=set)
+    # Per-{model, source} token + cost breakdowns. Each value dict carries
+    # {input, output, cache_creation, cache_read, cost, calls}.
+    by_model: dict[str, dict[str, float]] = field(default_factory=dict)
+    by_source: dict[str, dict[str, float]] = field(default_factory=dict)
 
     # Compaction
     compaction_count: int = 0
@@ -416,15 +510,75 @@ class Aggregator:
     # Models seen
     models: set[str] = field(default_factory=set)
 
+    # Subagent breakdown — count + cumulative cost per agentType, plus how many
+    # agent-*.jsonl files contributed at all.
+    subagent_files: int = 0
+    by_agent_type: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Map agent_id -> agentType for tagging in `by_agent_type` while walking rows.
+    agent_id_to_type: dict[str, str] = field(default_factory=dict)
+
     # Normalized event stream we'll persist as events.jsonl
     events: list[dict] = field(default_factory=list)
 
     # Raw transcript rows (for snippet artifact)
     raw_rows: list[dict] = field(default_factory=list)
 
-    def _bump_bucket(self, bucket: str, dur: float) -> None:
+    def _bump_bucket(self, bucket: str, dur: float, source: str = "main") -> None:
         self.bucket_time[bucket] = self.bucket_time.get(bucket, 0.0) + dur
         self.bucket_count[bucket] = self.bucket_count.get(bucket, 0) + 1
+        bs = self.bucket_time_by_source.setdefault(bucket, {})
+        bs[source] = bs.get(source, 0.0) + dur
+
+    def _bump_by_model(self, model: str, usage: dict, cost: float | None) -> None:
+        if not model:
+            return
+        d = self.by_model.setdefault(model, {"input": 0, "output": 0,
+                                             "cache_creation": 0, "cache_read": 0,
+                                             "cost": 0.0, "calls": 0})
+        d["input"] += int(usage.get("input_tokens") or 0)
+        d["output"] += int(usage.get("output_tokens") or 0)
+        d["cache_creation"] += int(usage.get("cache_creation_input_tokens") or 0)
+        d["cache_read"] += int(usage.get("cache_read_input_tokens") or 0)
+        d["calls"] += 1
+        if cost is not None:
+            d["cost"] += cost
+
+    def _bump_by_source(self, source: str, usage: dict, cost: float | None) -> None:
+        d = self.by_source.setdefault(source, {"input": 0, "output": 0,
+                                               "cache_creation": 0, "cache_read": 0,
+                                               "cost": 0.0, "calls": 0})
+        d["input"] += int(usage.get("input_tokens") or 0)
+        d["output"] += int(usage.get("output_tokens") or 0)
+        d["cache_creation"] += int(usage.get("cache_creation_input_tokens") or 0)
+        d["cache_read"] += int(usage.get("cache_read_input_tokens") or 0)
+        d["calls"] += 1
+        if cost is not None:
+            d["cost"] += cost
+
+    def _bump_by_agent_type(self, agent_id: str, usage: dict, cost: float | None) -> None:
+        agent_type = self.agent_id_to_type.get(agent_id, "unknown") or "unknown"
+        d = self.by_agent_type.setdefault(agent_type, {"input": 0, "output": 0,
+                                                       "cache_creation": 0, "cache_read": 0,
+                                                       "cost": 0.0, "calls": 0,
+                                                       "agents": 0})
+        d["input"] += int(usage.get("input_tokens") or 0)
+        d["output"] += int(usage.get("output_tokens") or 0)
+        d["cache_creation"] += int(usage.get("cache_creation_input_tokens") or 0)
+        d["cache_read"] += int(usage.get("cache_read_input_tokens") or 0)
+        d["calls"] += 1
+        if cost is not None:
+            d["cost"] += cost
+
+    def register_agent_meta(self, agent_id: str, meta: dict) -> None:
+        """Record agentType for an agent_id so per-row attribution lands in the right bucket."""
+        atype = meta.get("agentType") or meta.get("agent_type") or ""
+        self.agent_id_to_type[agent_id] = atype
+        self.subagent_files += 1
+        slot = self.by_agent_type.setdefault(atype or "unknown",
+                                             {"input": 0, "output": 0,
+                                              "cache_creation": 0, "cache_read": 0,
+                                              "cost": 0.0, "calls": 0, "agents": 0})
+        slot["agents"] += 1
 
     def _record_tool(self, name: str, dur: float, ok: bool, exact: bool) -> None:
         self.per_tool_time[name] = self.per_tool_time.get(name, 0.0) + dur
@@ -460,16 +614,21 @@ class Aggregator:
         self.raw_rows = windowed
 
         # 2) Merge multi-row assistant messages by message.id. User rows pass through.
+        # Key includes _qs_source so that the (extremely unlikely) collision
+        # between a parent message id and a subagent message id can't merge two
+        # different API calls into one. Within one file the message.id alone
+        # already disambiguates, so this is purely defensive.
         merged: list[dict] = []
-        asst_by_mid: dict[str, dict] = {}
+        asst_by_mid: dict[tuple[str, str], dict] = {}
         for r in windowed:
             if r.get("type") != "assistant":
                 merged.append(r)
                 continue
             msg = r.get("message") or {}
             mid = msg.get("id") or r.get("uuid") or ""
-            if mid in asst_by_mid:
-                existing = asst_by_mid[mid]
+            key = (r.get("_qs_source") or "main", mid)
+            if key in asst_by_mid:
+                existing = asst_by_mid[key]
                 # Append content blocks from this row to the merged content.
                 existing_msg = existing.setdefault("message", {})
                 existing_content = existing_msg.setdefault("content", [])
@@ -483,7 +642,11 @@ class Aggregator:
                 continue
             # First row for this message id — copy so we don't mutate input.
             copy = json.loads(json.dumps(r))
-            asst_by_mid[mid] = copy
+            # json round-trip drops the synthetic source tag; restore it.
+            copy["_qs_source"] = r.get("_qs_source") or "main"
+            if "_qs_agent_id" in r:
+                copy["_qs_agent_id"] = r["_qs_agent_id"]
+            asst_by_mid[key] = copy
             merged.append(copy)
 
         merged.sort(key=lambda r: parse_ts(r.get("timestamp")) or 0.0)
@@ -555,7 +718,10 @@ class Aggregator:
 
             if t == "assistant":
                 self.assistant_turns += 1
-                is_side = bool(r.get("isSidechain"))
+                # Authoritative: which file did this row come from? `isSidechain`
+                # works in practice but we trust file location across schema drift.
+                src = r.get("_qs_source") or ("subagent" if r.get("isSidechain") else "main")
+                is_side = src == "subagent"
                 if is_side:
                     self.sidechain_turns += 1
                 model = msg.get("model") or ""
@@ -567,11 +733,10 @@ class Aggregator:
                     delta = max(0.0, ts - last_ts)
                     self.api_time_sum += delta
                     self.api_time_by_model[model] = self.api_time_by_model.get(model, 0.0) + delta
-                    src = "subagent" if is_side else "main"
                     self.api_time_by_query_source[src] = self.api_time_by_query_source.get(src, 0.0) + delta
                     self.events.append({
                         "ts": fmt_ts(ts), "kind": "turn_end", "dur_s": round(delta, 3),
-                        "model": model, "is_sidechain": is_side,
+                        "model": model, "is_sidechain": is_side, "source": src,
                         "msg_uuid": r.get("uuid", ""),
                     })
 
@@ -579,20 +744,55 @@ class Aggregator:
                 u = msg.get("usage") or {}
                 if u:
                     self.api_call_count += 1
+                    self.api_call_count_by_source[src] = self.api_call_count_by_source.get(src, 0) + 1
                     self.input_tokens          += int(u.get("input_tokens") or 0)
                     self.output_tokens         += int(u.get("output_tokens") or 0)
                     self.cache_creation_tokens += int(u.get("cache_creation_input_tokens") or 0)
                     self.cache_read_tokens     += int(u.get("cache_read_input_tokens") or 0)
+                    # 1h vs 5m cache writes — billed differently (1h is 2× cost).
+                    cc = u.get("cache_creation") or {}
+                    if isinstance(cc, dict):
+                        self.cache_creation_5m_tokens += int(cc.get("ephemeral_5m_input_tokens") or 0)
+                        self.cache_creation_1h_tokens += int(cc.get("ephemeral_1h_input_tokens") or 0)
+                    # Server-side tool invocations (web_search/web_fetch hosted by API).
+                    stu = u.get("server_tool_use") or {}
+                    if isinstance(stu, dict):
+                        for k, v in stu.items():
+                            if isinstance(v, (int, float)) and v:
+                                self.server_tool_use_counts[k] = self.server_tool_use_counts.get(k, 0) + int(v)
+                    # service_tier / speed
+                    tier = u.get("service_tier") or ""
+                    if tier:
+                        self.service_tier_counts[tier] = self.service_tier_counts.get(tier, 0) + 1
+                    speed = u.get("speed") or ""
+                    if speed:
+                        self.speed_counts[speed] = self.speed_counts.get(speed, 0) + 1
+
                     c = turn_cost(u, model, self.prices)
                     if c is None and model:
                         self.cost_uncovered_models.add(model)
                     elif c is not None:
                         self.cost_usd += c
 
+                    self._bump_by_model(model, u, c)
+                    self._bump_by_source(src, u, c)
+                    if is_side:
+                        agent_id = r.get("_qs_agent_id") or ""
+                        if agent_id:
+                            self._bump_by_agent_type(agent_id, u, c)
+
                     if self._expecting_post_compaction:
                         self.post_compaction_tokens = int(u.get("input_tokens") or 0)
                         self._expecting_post_compaction = False
                     self._last_input_tokens_before_compaction = int(u.get("input_tokens") or 0)
+
+                # thinking blocks (extended-thinking output, already counted in output_tokens).
+                for c in (msg.get("content") or []):
+                    if isinstance(c, dict) and c.get("type") == "thinking":
+                        self.thinking_blocks += 1
+                        text = c.get("thinking") or c.get("text") or ""
+                        if isinstance(text, str):
+                            self.thinking_text_chars += len(text)
 
                 # request_id / retry detection
                 rid = r.get("requestId") or msg.get("id") or ""
@@ -602,8 +802,11 @@ class Aggregator:
                     else:
                         self.seen_request_ids.add(rid)
 
-                # error detection
+                # stop_reason distribution
                 stop = msg.get("stop_reason") or ""
+                if stop:
+                    self.stop_reason_counts[stop] = self.stop_reason_counts.get(stop, 0) + 1
+                # error detection
                 if stop in ("error", "refusal"):
                     self.api_error_count += 1
 
@@ -628,17 +831,29 @@ class Aggregator:
 
                     if bundle_user_ts is not None:
                         bundle_wall = max(0.0, bundle_user_ts - ts)
-                        parent_bundle_wall[r.get("uuid", "")] = bundle_wall
                         n = len(tool_uses)
                         per_share = bundle_wall / max(1, n)
                         is_solo = (n == 1)
+                        # Critical-path accounting: when have_subagent_files, exclude
+                        # Agent/Skill bundles from the parent's bundle wall — the
+                        # subagent file's own api_time + tool_time already covers
+                        # that interval, so adding the parent's wall here would
+                        # double-count time. The bundle is still walked below for
+                        # COUNT purposes; only its time gets suppressed.
+                        any_agent_dispatch = any(
+                            (tu.get("name") or "") in AGENT_TOOLS for tu in tool_uses
+                        )
+                        suppress_time = self.have_subagent_files and any_agent_dispatch
+                        if not suppress_time:
+                            parent_bundle_wall[r.get("uuid", "")] = bundle_wall
                         for tu, tr in matched_results:
                             name = tu.get("name") or ""
                             tin = tu.get("input") or {}
                             ok = bool(tr) and not bool(tr.get("is_error", False))
                             bucket = classify_tool(name, tin)
-                            self._bump_bucket(bucket, per_share)
-                            self._record_tool(name, per_share, ok, exact=is_solo)
+                            tool_dur = 0.0 if suppress_time else per_share
+                            self._bump_bucket(bucket, tool_dur, src)
+                            self._record_tool(name, tool_dur, ok, exact=is_solo)
 
                             txt = tr.get("content") if tr else ""
                             if isinstance(txt, list):
@@ -660,9 +875,11 @@ class Aggregator:
                                 "kind": "tool_end",
                                 "tool": name,
                                 "bucket": bucket,
-                                "dur_s": round(per_share, 3),
+                                "dur_s": round(tool_dur, 3),
                                 "exact": is_solo,
                                 "ok": ok,
+                                "source": src,
+                                "time_suppressed": suppress_time,
                                 "tool_use_id": tu.get("id", ""),
                                 "parent_msg_uuid": r.get("uuid", ""),
                             })
@@ -877,14 +1094,43 @@ def report_dict(state: dict, agg: Aggregator, end_ts: float) -> dict:
         "checkpoint_download_time_s": round(agg.bucket_time.get("checkpoint_dl", 0.0), 3),
         "benchmark_run_time_s": round(agg.bucket_time.get("benchmark_run", 0.0), 3),
         "test_time_s": round(agg.bucket_time.get("test", 0.0), 3),
+        "tool_time_by_bucket_by_source_s": {
+            k: {src: round(v, 3) for src, v in by_src.items()}
+            for k, by_src in agg.bucket_time_by_source.items()
+        },
         "tool_result_tokens_est": agg.tool_result_tokens_est,
         "total_input_tokens": agg.input_tokens,
         "total_output_tokens": agg.output_tokens,
         "cache_read_tokens": agg.cache_read_tokens,
         "cache_creation_tokens": agg.cache_creation_tokens,
+        "cache_creation_5m_tokens": agg.cache_creation_5m_tokens,
+        "cache_creation_1h_tokens": agg.cache_creation_1h_tokens,
+        # Cache-hit ratio: cache_read / (input + cache_creation + cache_read).
+        # 1.0 means everything was a cache hit (cheapest); 0.0 means no caching.
+        "cache_hit_ratio": (
+            round(agg.cache_read_tokens / max(1, (agg.input_tokens
+                                                  + agg.cache_creation_tokens
+                                                  + agg.cache_read_tokens)), 4)
+        ),
+        "thinking_blocks": agg.thinking_blocks,
+        "thinking_text_chars": agg.thinking_text_chars,
         "estimated_token_cost_usd": round(agg.cost_usd, 4),
         "cost_uncovered_models": sorted(agg.cost_uncovered_models),
         "cost_disclaimer": "estimated from per-turn usage and a static price table; not a billing source of truth",
+        # Per-model + per-source breakdowns (mirror Anthropic's modelUsage / query_source).
+        "tokens_cost_by_model": {
+            m: {**{k: int(v) if k != "cost" else round(float(v), 4) for k, v in d.items()}}
+            for m, d in agg.by_model.items()
+        },
+        "tokens_cost_by_query_source": {
+            s: {**{k: int(v) if k != "cost" else round(float(v), 4) for k, v in d.items()}}
+            for s, d in agg.by_source.items()
+        },
+        "tokens_cost_by_agent_type": {
+            at: {**{k: int(v) if k != "cost" else round(float(v), 4) for k, v in d.items()}}
+            for at, d in agg.by_agent_type.items()
+        },
+        "subagent_files": agg.subagent_files,
         "models": sorted(agg.models),
         "turns": agg.assistant_turns,
         "user_prompts": agg.user_prompts,
@@ -892,6 +1138,11 @@ def report_dict(state: dict, agg: Aggregator, end_ts: float) -> dict:
         "tool_calls": agg.tool_calls,
         "subagent_calls": agg.subagent_calls,
         "sidechain_turns": agg.sidechain_turns,
+        "api_call_count_by_source": dict(agg.api_call_count_by_source),
+        "stop_reason_counts": dict(agg.stop_reason_counts),
+        "server_tool_use_counts": dict(agg.server_tool_use_counts),
+        "service_tier_counts": dict(agg.service_tier_counts),
+        "speed_counts": dict(agg.speed_counts),
         "compaction_count": agg.compaction_count,
         "compaction_time_s": round(agg.compaction_time, 3),
         "pre_compaction_tokens": agg._last_input_tokens_before_compaction,
@@ -962,9 +1213,44 @@ def render_table(rep: dict) -> str:
     L.append("├─ tokens")
     L.append(f"│  input             {fmt_tok(rep['total_input_tokens']):>10}")
     L.append(f"│  output            {fmt_tok(rep['total_output_tokens']):>10}")
-    L.append(f"│  cache write       {fmt_tok(rep['cache_creation_tokens']):>10}")
-    L.append(f"│  cache read        {fmt_tok(rep['cache_read_tokens']):>10}")
+    cw_total = rep['cache_creation_tokens']
+    cw_5m = rep.get('cache_creation_5m_tokens', 0)
+    cw_1h = rep.get('cache_creation_1h_tokens', 0)
+    if cw_1h or cw_5m:
+        L.append(f"│  cache write       {fmt_tok(cw_total):>10}  (5m={fmt_tok(cw_5m)}, 1h={fmt_tok(cw_1h)})")
+    else:
+        L.append(f"│  cache write       {fmt_tok(cw_total):>10}")
+    L.append(f"│  cache read        {fmt_tok(rep['cache_read_tokens']):>10}  (hit_ratio={rep.get('cache_hit_ratio', 0):.2f})")
+    if rep.get("thinking_blocks"):
+        L.append(f"│  thinking blocks   {rep['thinking_blocks']:>10}  ({fmt_tok(rep.get('thinking_text_chars', 0)//4)} tok est)")
     L.append(f"│  tool result (est) {fmt_tok(rep['tool_result_tokens_est']):>10}")
+    if rep.get("tokens_cost_by_query_source"):
+        L.append("├─ tokens / cost by source")
+        for src, d in sorted(rep["tokens_cost_by_query_source"].items(),
+                             key=lambda x: -float(x[1].get("cost") or 0)):
+            L.append(f"│  {src:<10} ${float(d.get('cost') or 0):>8.4f}  "
+                     f"in={fmt_tok(int(d.get('input') or 0))}  "
+                     f"out={fmt_tok(int(d.get('output') or 0))}  "
+                     f"cw={fmt_tok(int(d.get('cache_creation') or 0))}  "
+                     f"cr={fmt_tok(int(d.get('cache_read') or 0))}  "
+                     f"calls={int(d.get('calls') or 0)}")
+    if rep.get("tokens_cost_by_model"):
+        L.append("├─ tokens / cost by model")
+        for m, d in sorted(rep["tokens_cost_by_model"].items(),
+                           key=lambda x: -float(x[1].get("cost") or 0)):
+            L.append(f"│  {m[:28]:<28} ${float(d.get('cost') or 0):>8.4f}  "
+                     f"in={fmt_tok(int(d.get('input') or 0))}  "
+                     f"out={fmt_tok(int(d.get('output') or 0))}  "
+                     f"calls={int(d.get('calls') or 0)}")
+    if rep.get("tokens_cost_by_agent_type"):
+        L.append(f"├─ subagents ({rep.get('subagent_files', 0)} files)")
+        for at, d in sorted(rep["tokens_cost_by_agent_type"].items(),
+                            key=lambda x: -float(x[1].get("cost") or 0)):
+            L.append(f"│  {at[:28]:<28} ${float(d.get('cost') or 0):>8.4f}  "
+                     f"in={fmt_tok(int(d.get('input') or 0))}  "
+                     f"out={fmt_tok(int(d.get('output') or 0))}  "
+                     f"agents={int(d.get('agents') or 0)}  "
+                     f"calls={int(d.get('calls') or 0)}")
     L.append("├─ cost")
     cost = rep["estimated_token_cost_usd"]
     L.append(f"│  estimated         ${cost:>9.4f}  (not billing truth)")
@@ -976,13 +1262,21 @@ def render_table(rep: dict) -> str:
     L.append(f"│    sidechain      {rep['sidechain_turns']:>11d}")
     L.append(f"│  user prompts     {rep['user_prompts']:>11d}")
     L.append(f"│  tool calls       {rep['tool_calls']:>11d}")
-    L.append(f"│  subagent calls   {rep['subagent_calls']:>11d}")
+    L.append(f"│  subagent calls   {rep['subagent_calls']:>11d}  ({rep.get('subagent_files', 0)} agent files)")
     L.append(f"│  api errors       {rep['api_error_count']:>11d}")
     L.append(f"│  retries          {rep['retry_count']:>11d}")
     L.append(f"│  compactions      {rep['compaction_count']:>11d}")
     if rep["compaction_count"]:
         L.append(f"│    pre-tokens     {fmt_tok(rep['pre_compaction_tokens']):>11}")
         L.append(f"│    post-tokens    {fmt_tok(rep['post_compaction_tokens']):>11}")
+    stu = rep.get("server_tool_use_counts") or {}
+    if any(stu.values()):
+        nonzero = ", ".join(f"{k}={v}" for k, v in stu.items() if v)
+        L.append(f"│  server tools     {nonzero}")
+    sr = rep.get("stop_reason_counts") or {}
+    if sr:
+        nonzero = ", ".join(f"{k}={v}" for k, v in sorted(sr.items(), key=lambda x: -x[1]))
+        L.append(f"│  stop reasons     {nonzero}")
     if rep["lines_added"] or rep["lines_removed"]:
         L.append(f"│  lines +{rep['lines_added']} / -{rep['lines_removed']}")
     L.append(f"╰─ artifacts under: {rep.get('_window_dir', '?')}")
@@ -1040,19 +1334,61 @@ def render_markdown(rep: dict) -> str:
     L.append("|---|---|")
     L.append(f"| input | {rep['total_input_tokens']:,} |")
     L.append(f"| output | {rep['total_output_tokens']:,} |")
-    L.append(f"| cache write | {rep['cache_creation_tokens']:,} |")
+    L.append(f"| cache write (5m) | {rep.get('cache_creation_5m_tokens', 0):,} |")
+    L.append(f"| cache write (1h) | {rep.get('cache_creation_1h_tokens', 0):,} |")
+    L.append(f"| cache write total | {rep['cache_creation_tokens']:,} |")
     L.append(f"| cache read | {rep['cache_read_tokens']:,} |")
+    L.append(f"| cache hit ratio | {rep.get('cache_hit_ratio', 0):.4f} |")
+    if rep.get("thinking_blocks"):
+        L.append(f"| thinking blocks | {rep['thinking_blocks']:,} ({rep.get('thinking_text_chars', 0)//4:,} tok est) |")
     L.append(f"| tool result (est) | {rep['tool_result_tokens_est']:,} |")
     L.append(f"\n**Estimated cost**: `${rep['estimated_token_cost_usd']:.4f}` "
              f"_(not billing truth)_")
     if rep["cost_uncovered_models"]:
         L.append(f"\n> ⚠ Uncovered models (no price table entry): "
                  f"{', '.join('`' + m + '`' for m in rep['cost_uncovered_models'])}")
+    if rep.get("tokens_cost_by_query_source"):
+        L.append("\n## Cost by query source")
+        L.append("| source | $ | input | output | cache_write | cache_read | calls |")
+        L.append("|---|---|---|---|---|---|---|")
+        for src, d in sorted(rep["tokens_cost_by_query_source"].items(),
+                             key=lambda x: -float(x[1].get("cost") or 0)):
+            L.append(f"| `{src}` | ${float(d.get('cost') or 0):.4f} | "
+                     f"{int(d.get('input') or 0):,} | {int(d.get('output') or 0):,} | "
+                     f"{int(d.get('cache_creation') or 0):,} | {int(d.get('cache_read') or 0):,} | "
+                     f"{int(d.get('calls') or 0)} |")
+    if rep.get("tokens_cost_by_model"):
+        L.append("\n## Cost by model")
+        L.append("| model | $ | input | output | cache_write | cache_read | calls |")
+        L.append("|---|---|---|---|---|---|---|")
+        for m, d in sorted(rep["tokens_cost_by_model"].items(),
+                           key=lambda x: -float(x[1].get("cost") or 0)):
+            L.append(f"| `{m}` | ${float(d.get('cost') or 0):.4f} | "
+                     f"{int(d.get('input') or 0):,} | {int(d.get('output') or 0):,} | "
+                     f"{int(d.get('cache_creation') or 0):,} | {int(d.get('cache_read') or 0):,} | "
+                     f"{int(d.get('calls') or 0)} |")
+    if rep.get("tokens_cost_by_agent_type"):
+        L.append(f"\n## Subagents ({rep.get('subagent_files', 0)} files)")
+        L.append("| agentType | $ | input | output | cache_read | agents | calls |")
+        L.append("|---|---|---|---|---|---|---|")
+        for at, d in sorted(rep["tokens_cost_by_agent_type"].items(),
+                            key=lambda x: -float(x[1].get("cost") or 0)):
+            L.append(f"| `{at or 'unknown'}` | ${float(d.get('cost') or 0):.4f} | "
+                     f"{int(d.get('input') or 0):,} | {int(d.get('output') or 0):,} | "
+                     f"{int(d.get('cache_read') or 0):,} | {int(d.get('agents') or 0)} | "
+                     f"{int(d.get('calls') or 0)} |")
     L.append(f"\n## Turns")
     L.append(f"- assistant turns: {rep['turns']}  (debug: {rep['debug_turns']}, sidechain: {rep['sidechain_turns']})")
     L.append(f"- user prompts: {rep['user_prompts']}")
     L.append(f"- tool calls: {rep['tool_calls']}  (subagent: {rep['subagent_calls']})")
     L.append(f"- api errors: {rep['api_error_count']}, retries: {rep['retry_count']}")
+    if rep.get("stop_reason_counts"):
+        srs = ", ".join(f"{k}={v}" for k, v in
+                        sorted(rep["stop_reason_counts"].items(), key=lambda x: -x[1]))
+        L.append(f"- stop reasons: {srs}")
+    stu = rep.get("server_tool_use_counts") or {}
+    if any(stu.values()):
+        L.append(f"- server-side tools: {', '.join(f'{k}={v}' for k, v in stu.items() if v)}")
     L.append(f"- compactions: {rep['compaction_count']}")
     if rep['compaction_count']:
         L.append(f"  - pre-compaction tokens: {rep['pre_compaction_tokens']:,}")
@@ -1184,10 +1520,18 @@ def cmd_stop(args) -> int:
 
     end_ts = time.time()
     transcript_path = Path(state["transcript_path"])
-    rows = list(iter_jsonl(transcript_path))
+    rows, sub_files = load_session_rows(transcript_path)
 
     prices = parse_prices_override(args.prices) or DEFAULT_PRICES
-    agg = Aggregator(start_ts=state["start_ts"], end_ts=end_ts, prices=prices)
+    agg = Aggregator(
+        start_ts=state["start_ts"],
+        end_ts=end_ts,
+        prices=prices,
+        have_subagent_files=bool(sub_files),
+    )
+    for jl, meta in sub_files:
+        agent_id = jl.stem.removeprefix("agent-")
+        agg.register_agent_meta(agent_id, meta)
     agg.feed_transcript(rows)
     agg.feed_marks(state.get("marks") or [])
 
