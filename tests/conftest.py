@@ -5,9 +5,12 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+
+from _synth import Transcript, parent_path, subagent_path, write_subagent_meta
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "cc_profiler.py"
@@ -77,6 +80,7 @@ def env_factory(tmp_path):
 
     _build.cwd = cwd  # type: ignore[attr-defined]
     _build.state_home = state_home  # type: ignore[attr-defined]
+    _build.claude_home = claude_home  # type: ignore[attr-defined]
     return _build
 
 
@@ -100,3 +104,101 @@ def run_cli(env_factory):
         return r
 
     return _run
+
+
+@dataclass
+class BuiltWindow:
+    """Handle returned by `built_window` — one prepared profiling window.
+
+    The window is already started, with `start_ts` patched to 0 so test rows
+    with arbitrary past timestamps fall inside the window. Caller writes
+    transcripts via `parent` / `sub(agent_id)`, then calls `stop()` to get the
+    JSON report.
+    """
+
+    env: dict[str, str]
+    cwd: Path
+    parent_jsonl: Path
+    state_json: Path
+    parent: Transcript
+    _run_cli: callable
+    _subs: list[tuple[str, Transcript]] = field(default_factory=list)
+
+    def sub(self, agent_id: str, agent_type: str = "Explore") -> Transcript:
+        """Get (or create) a Transcript builder for a subagent file."""
+        for aid, t in self._subs:
+            if aid == agent_id:
+                return t
+        sub_jsonl = subagent_path(self.parent_jsonl, agent_id)
+        write_subagent_meta(sub_jsonl, agent_type=agent_type)
+        t = Transcript(path=sub_jsonl)
+        self._subs.append((agent_id, t))
+        return t
+
+    def stop(self) -> dict:
+        """Flush all transcripts to disk and run `stop --format=json`. Returns the report dict."""
+        self.parent.write()
+        for _aid, t in self._subs:
+            t.write()
+        r = self._run_cli(["stop", "--format=json"], env=self.env)
+        if r.returncode != 0:
+            raise AssertionError(
+                f"stop failed (rc={r.returncode}):\nstdout: {r.stdout}\nstderr: {r.stderr}"
+            )
+        return json.loads(r.stdout)
+
+
+@pytest.fixture
+def built_window(env_factory, run_cli):
+    """Set up + start a profiling window, with `start_ts` patched to 0.
+
+    Returns a `BuiltWindow` whose `parent` is a fresh `Transcript` builder
+    targeting the parent JSONL file (so writing it overwrites the seed row
+    `_make_transcript` placed there). Use `.sub(agent_id)` to get builders for
+    subagent files. Call `.stop()` to flush + collect the report.
+    """
+
+    def _build(session_key: str = "default", session_id: str = "11111111-aaaa-aaaa-aaaa-111111111111") -> BuiltWindow:
+        env = env_factory(session_key, session_id)
+
+        # Run start so the active pointer + window dir get created.
+        r = run_cli(["start", "test-window"], env=env)
+        if r.returncode != 0:
+            raise AssertionError(f"start failed: {r.stderr}")
+
+        # Locate the active pointer for this session_key and patch start_ts=0.
+        # That way, transcript rows with our anchored 2026-01-01 timestamps fall
+        # within the window even though `start_ts = time.time()` originally.
+        state_home = env_factory.state_home  # type: ignore[attr-defined]
+        active_dir = state_home / "claude-code-profiler" / "active"
+        actives = list(active_dir.glob("*.json"))
+        assert actives, f"no active pointer found under {active_dir}"
+        # Pick the one matching this session_key (sanitization is conservative).
+        ptr_path = actives[0] if len(actives) == 1 else next(
+            p for p in actives if session_key.replace("/", "_") in p.name
+        )
+        state = json.loads(ptr_path.read_text())
+        state["start_ts"] = 0.0
+        ptr_path.write_text(json.dumps(state))
+        # Mirror to the per-window state.json the cmd_start wrote.
+        win_state = Path(state["window_dir"]) / "state.json"
+        if win_state.is_file():
+            ws = json.loads(win_state.read_text())
+            ws["start_ts"] = 0.0
+            win_state.write_text(json.dumps(ws))
+
+        cwd = env_factory.cwd  # type: ignore[attr-defined]
+        claude_home = env_factory.claude_home  # type: ignore[attr-defined]
+        parent_jsonl = parent_path(claude_home, cwd, session_id)
+        parent_builder = Transcript(path=parent_jsonl)
+
+        return BuiltWindow(
+            env=env,
+            cwd=cwd,
+            parent_jsonl=parent_jsonl,
+            state_json=ptr_path,
+            parent=parent_builder,
+            _run_cli=run_cli,
+        )
+
+    return _build

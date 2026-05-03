@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.1
+
+### Fixed
+- **Cross-file message-id collision** — `feed_transcript`'s streaming-merge
+  dedup key now includes `_qs_agent_id` alongside `(source, message.id)`. Real
+  Anthropic message ids are globally unique so this is defensive, but if two
+  subagent files ever shared an id (fuzzed input, replayed fixtures, future
+  schema drift) the previous key would silently fold two distinct API calls
+  into one and undercount turns / tokens / cost.
+
+### Added — tests
+- `tests/test_turn_counting.py` (11 tests) locks the relationship between
+  transcript rows and reported counters: `turns`, `sidechain_turns`,
+  `debug_turns`, `user_prompts`, `tool_calls`, `subagent_calls`,
+  `subagent_files`, `api_call_count_by_source`, plus message-id dedup,
+  legacy-`isSidechain` parent rows, and the cross-file collision regression.
+- `tests/_synth.py` — JSONL transcript builders (parent + subagent files,
+  text/tool-use/streaming-chunk rows). Module-level globally-unique id
+  counters mirror real Anthropic message-id semantics.
+- `tests/conftest.py` — `built_window` fixture: starts a window, patches
+  `start_ts=0` so test rows with anchored past timestamps fall in-window,
+  exposes `parent` / `sub(agent_id)` builders + `stop()`.
+
 ## 0.2.0
 
 ### Fixed

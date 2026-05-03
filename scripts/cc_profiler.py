@@ -614,19 +614,19 @@ class Aggregator:
         self.raw_rows = windowed
 
         # 2) Merge multi-row assistant messages by message.id. User rows pass through.
-        # Key includes _qs_source so that the (extremely unlikely) collision
-        # between a parent message id and a subagent message id can't merge two
-        # different API calls into one. Within one file the message.id alone
-        # already disambiguates, so this is purely defensive.
+        # Key includes _qs_source AND _qs_agent_id so that any cross-file collision
+        # (parent vs subagent, or two distinct subagent files) can't merge two
+        # different API calls into one. Real Anthropic message ids are globally
+        # unique so this is defensive, but the cost is one extra tuple element.
         merged: list[dict] = []
-        asst_by_mid: dict[tuple[str, str], dict] = {}
+        asst_by_mid: dict[tuple[str, str, str], dict] = {}
         for r in windowed:
             if r.get("type") != "assistant":
                 merged.append(r)
                 continue
             msg = r.get("message") or {}
             mid = msg.get("id") or r.get("uuid") or ""
-            key = (r.get("_qs_source") or "main", mid)
+            key = (r.get("_qs_source") or "main", r.get("_qs_agent_id") or "", mid)
             if key in asst_by_mid:
                 existing = asst_by_mid[key]
                 # Append content blocks from this row to the merged content.
