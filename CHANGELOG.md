@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.3.0
+
+### Added — `retro` subcommand
+
+Profile a slice of the current session retroactively, without ever calling
+`start`. The motivating use case: you already did the work, didn't think to
+profile it, and now want the numbers anyway.
+
+```
+/profile retro                        # entire session so far
+/profile retro --since 30m            # last 30 minutes
+/profile retro --since last-prompt    # since your most recent message
+/profile retro --since 2026-05-04T11:26:45Z --until now
+```
+
+`--since` and `--until` accept ISO-8601 timestamps, epoch seconds, relative
+durations (`30m`, `1h30m`, `2d12h`, `45s`), or one of the literals: `now`,
+`first` (first transcript timestamp — default for `--since`), or
+`last-prompt` (most recent user message — skips tool-result rows and
+sidechain user turns). Default for `--until` is `now`.
+
+Retro emits the same artifact bundle as `stop` (`profile.json`, `profile.md`,
+`events.jsonl`, `transcript.snippet.jsonl`, `state.json`) into a new
+`windows/<id>/`. `state.json` and the report carry `mode: "retroactive"` so
+bundles are self-describing.
+
+`retro` never touches the active-profile pointer, so it's safe to run
+alongside an in-progress `/profile start`.
+
+### Refactored
+
+- Extracted the aggregation + artifact-emission body of `cmd_stop` into
+  `_aggregate_and_emit(state, end_ts, prices, args)`. Both `cmd_stop` and
+  `cmd_retro` reuse it, so the metrics, formats, and on-disk layout stay
+  identical between the two paths.
+
 ## 0.2.2
 
 ### Changed — terminology

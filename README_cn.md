@@ -23,6 +23,16 @@
 
 整个工作流就这三行。**会话中间不用塞额外提示、不用特殊语法、不用"记得记录这个"。** `stop` 时 profiler 自动回头扫一次 transcript，把 `start` ~ `stop` 之间发生过的事情聚合成下面那张表。一个 Claude Code 会话里 `start → stop → start → stop …` 想开几次开几次，每次都是独立的 profile。
 
+**忘了 `/profile start` 怎么办？** 用 `retro` —— 它直接扫已有的 transcript，按你指定的时间窗出同样的报告：
+
+```
+/profile retro                        # 整个会话从头到现在
+/profile retro --since 30m            # 最近 30 分钟
+/profile retro --since last-prompt    # 自从你最近一次发言
+```
+
+`retro` 写出的产物 bundle 跟 `stop` 一样，但**不动**当前的 active-profile 指针，所以正在跑 `/profile start` 时也能随手跑 `retro`，互不干扰。
+
 整篇 README 里说到 **profile**（名词）就是指这样一段 start→stop 之间的测量。这是 profiler 工具领域的标准用法 —— cProfile、Go pprof、Linux `perf` 都用 "profile" 指这次测量产出的数据，跟我们这里的慢命令（`/profile`）、工具名（`claude-code-profiler`）、产物文件（`profile.json`、`profile.md`）正好对得上。
 
 ---
@@ -183,9 +193,22 @@ python3 scripts/cc_profiler.py stop --format table
 | `status` | 看活跃 profile 已经累计了多长时间、几条 turn。 |
 | `mark <label>` | 在当前 profile 里追加一个带时间戳的标签（"docker pull starts here"、"benchmark begins"），出报告时一起输出。 |
 | `stop [--format=table\|markdown\|json] [--export DIR]` | 扫描 transcript [start_ts, now]，算指标，渲染报告，落盘 artifacts，清掉活跃指针。 |
+| `retro [--since WHEN] [--until WHEN] [--name NAME] [--format=...] [--export DIR]` | 不需要事先 `start`，直接对 transcript 上 `[--since, --until]` 任意窗口出报告。产物跟 `stop` 一样，`state.json` 会标 `mode: "retroactive"`。**不动**活跃 profile 指针。 |
 | `reset` | 不出报告，直接丢掉活跃 profile 指针。 |
 
-每个 Claude Code 会话同时只允许一个活跃 profile。活跃 profile 指针是按 session 隔离的 —— 同一台机器上并发的多个 Claude Code 会话各有自己的指针，互不干扰（在 `tests/test_concurrent_sessions.py` 里有回归测试）。一个会话内 `start → stop → start → stop …` 没问题，同一个会话里同时开两个 profile 不行。
+每个 Claude Code 会话同时只允许一个活跃 profile。活跃 profile 指针是按 session 隔离的 —— 同一台机器上并发的多个 Claude Code 会话各有自己的指针，互不干扰（在 `tests/test_concurrent_sessions.py` 里有回归测试）。一个会话内 `start → stop → start → stop …` 没问题，同一个会话里同时开两个 profile 不行。（`retro` 是例外 —— 它从来不占活跃指针，所以 `start` 还在跑的时候随时能跑 `retro`。）
+
+### `retro --since` / `--until` 接受的时间格式
+
+`WHEN` 可以是：
+
+- `now` —— 当前墙钟时间（`--until` 默认值）。
+- `first` —— 父 transcript 第一条带时间戳的 row（`--since` 默认值）。
+- `last-prompt` —— 最近一次真实的 user prompt（跳过 tool-result rows 和 sidechain 的 user 行）。适合"看看我最近这条消息触发了多少活儿"。
+- ISO-8601 时间戳（如 `2026-05-04T11:26:45Z`）或裸的 epoch 秒数。
+- 相对 duration（"多久之前"）：`30m`、`1h30m`、`2d12h`、`45s`。可以拼组合，空格随意。
+
+`--since >= --until` 时 retro 退出码 2。
 
 ---
 

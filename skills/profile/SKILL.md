@@ -1,8 +1,8 @@
 ---
 name: profile
-description: Profile a Claude Code session window — measures wall time, API time, tool time, token cost, and per-bucket breakdowns (docker pull/build, dataset/checkpoint download, benchmark run, test, etc.). Invoked as `/profile start|status|mark|stop|reset`. Use when the user wants to measure cost or time of a chunk of work in this session.
+description: Profile a Claude Code session window — measures wall time, API time, tool time, token cost, and per-bucket breakdowns (docker pull/build, dataset/checkpoint download, benchmark run, test, etc.). Invoked as `/profile start|status|mark|stop|retro|reset`. Use when the user wants to measure cost or time of a chunk of work in this session, including retroactive profiling when they forgot to call `start`.
 allowed-tools: Bash
-argument-hint: start [name] [--tag k=v]... [--note "..."] | status | mark <label> | stop [--format=table|markdown|json] [--export DIR] | reset
+argument-hint: start [name] [--tag k=v]... [--note "..."] | status | mark <label> | stop [--format=table|markdown|json] [--export DIR] | retro [--since WHEN] [--until WHEN] [--name NAME] [--format=...] [--export DIR] | reset
 ---
 
 # /profile — Claude Code session profiler
@@ -47,8 +47,11 @@ Map the user's arguments to `<subcommand> <args...>`. Pass arguments through ver
 | `/profile status` | `status` |
 | `/profile mark <label>` | `mark <label>` |
 | `/profile stop [--format=...] [--export DIR]` | `stop [--format=...] [--export DIR]` |
+| `/profile retro [--since WHEN] [--until WHEN] [--name NAME] [--format=...] [--export DIR]` | `retro [--since WHEN] [--until WHEN] [--name NAME] [--format=...] [--export DIR]` |
 | `/profile reset` | `reset` |
 | `/profile` (no args) | `status` (treat as status) |
+
+`retro` is for the case where the user wants a profile but never called `start`. Pass `--since`/`--until` through verbatim. Recognized values for `WHEN`: ISO-8601 timestamp, epoch seconds, a relative duration (`30m`, `1h30m`, `2d12h`), or a literal — `now`, `first` (first transcript timestamp), `last-prompt` (most recent user prompt). Defaults: `--since=first`, `--until=now`. Retro never touches the active-profile pointer, so it's safe to run while a `start` is in flight.
 
 If the subcommand is unrecognized, replace the last line with `python3 "$SCRIPT" --help` and show the usage.
 
@@ -63,6 +66,7 @@ If the subcommand is unrecognized, replace the last line with `python3 "$SCRIPT"
   - `events.jsonl` — normalized event stream
   - `transcript.snippet.jsonl` — raw rows in window (for replay)
   - `state.json` — frozen start-time metadata
+- **retro** runs the same scan as `stop` but over an explicitly-specified `[since, until]` window of the existing transcript — no prior `start` required. Writes the same artifact bundle into a new `windows/<id>/`, with `state.json` carrying `mode: "retroactive"` so the bundle is self-describing. Does NOT touch the active-profile pointer.
 - **reset** discards the active window pointer without producing a report.
 
 ## Notes for you (the assistant)

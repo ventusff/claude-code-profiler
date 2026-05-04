@@ -23,6 +23,16 @@ Useful when you want to:
 
 That's the whole workflow. **No extra prompting mid-session, no special syntax to sprinkle into your messages, no "remember to log this".** On `stop`, the profiler scans the session transcript and aggregates everything that happened between `start` and `stop` into the table below. You can `start → stop → start → stop …` as many times as you like in one session — each is an independent profile.
 
+**Forgot to call `/profile start`?** Use `retro` instead — it scans the existing transcript over a window you specify and emits the same report:
+
+```
+/profile retro                        # whole session so far
+/profile retro --since 30m            # last 30 minutes
+/profile retro --since last-prompt    # since your most recent message
+```
+
+`retro` writes the same artifact bundle as `stop` but never touches the active-profile pointer, so it's safe to run alongside an in-progress `/profile start`.
+
 Throughout this README, **profile** (the noun) means one such start→stop measurement. We're using the standard term in profiler tooling — cProfile, Go pprof, and Linux `perf` all call the captured measurement period a "profile" — so the name lines up with the slash command (`/profile`), the tool (`claude-code-profiler`), and the artifacts it produces (`profile.json`, `profile.md`).
 
 ---
@@ -197,9 +207,22 @@ Caveat: the script auto-discovers the active session's transcript path from the 
 | `status` | Show how long the active profile has been running and how many turns it has accumulated. |
 | `mark <label>` | Append a timestamped label to the active profile ("docker pull starts here", "benchmark begins"). Marks are emitted in the final report. |
 | `stop [--format=table\|markdown\|json] [--export DIR]` | Scan the transcript over `[start_ts, now]`, compute metrics, render the report, persist artifacts, and clear the active pointer. |
+| `retro [--since WHEN] [--until WHEN] [--name NAME] [--format=...] [--export DIR]` | Scan the transcript over an arbitrary `[--since, --until]` window with no prior `start`. Same report and artifacts as `stop`. `state.json` is tagged `mode: "retroactive"`. Does not touch the active-profile pointer. |
 | `reset` | Discard the active profile without producing a report. |
 
-One active profile per Claude Code session. The active-profile pointer is keyed by session — concurrent Claude Code sessions on the same host each get their own and don't interfere (regression-tested in `tests/test_concurrent_sessions.py`). Within one session, `start → stop → start → stop …` is fine; two simultaneous profiles in the same session are not.
+One active profile per Claude Code session. The active-profile pointer is keyed by session — concurrent Claude Code sessions on the same host each get their own and don't interfere (regression-tested in `tests/test_concurrent_sessions.py`). Within one session, `start → stop → start → stop …` is fine; two simultaneous profiles in the same session are not. (`retro` is exempt — it never claims the active pointer, so it's safe to invoke during an in-progress `start`.)
+
+### `retro --since` / `--until` time specs
+
+`WHEN` is one of:
+
+- `now` — the current wall clock (default for `--until`).
+- `first` — the first timestamped row in the parent transcript (default for `--since`).
+- `last-prompt` — the most recent real user prompt (skipping tool-result rows and sidechain user turns). Useful for "profile what just happened in response to my last message".
+- An ISO-8601 timestamp like `2026-05-04T11:26:45Z` or a bare epoch number.
+- A relative duration ago: `30m`, `1h30m`, `2d12h`, `45s`. Compound forms allowed; whitespace optional.
+
+If `--since >= --until`, retro exits with code 2.
 
 ---
 

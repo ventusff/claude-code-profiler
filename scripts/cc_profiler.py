@@ -1289,6 +1289,8 @@ def render_markdown(rep: dict) -> str:
     L.append(f"- **Started**: {rep['started_at']}  ")
     L.append(f"- **Stopped**: {rep['stopped_at']}  ")
     L.append(f"- **Wall**: {fmt_dur(rep['wall_time_s'])}  ")
+    if rep.get("mode") == "retroactive":
+        L.append("- **Mode**: retroactive (assembled from existing transcript; no live `start`)  ")
     if rep.get("note"):
         L.append(f"- **Note**: {rep['note']}")
     if rep.get("git", {}).get("sha"):
@@ -1403,6 +1405,141 @@ def render_markdown(rep: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Time-spec resolution (for `retro --since` / `--until`)
+# ---------------------------------------------------------------------------
+
+# Match one duration token at a time so we can sum compound forms like "1h30m".
+# Anchored fullmatch (validating the whole string is duration tokens) is done
+# separately in `_parse_duration` — here we only extract.
+_DURATION_TOKEN_RE = re.compile(r"(\d+)\s*([dhms])")
+_DURATION_FULL_RE = re.compile(r"^(?:\d+\s*[dhms]\s*)+$")
+
+
+def _parse_duration(spec: str) -> float | None:
+    """Parse a relative-duration string into seconds. Returns None if not a duration.
+
+    Accepts compound forms with `d` (days), `h` (hours), `m` (minutes), `s`
+    (seconds). Examples: `30m`, `1h30m`, `2d12h`, `45s`. Whitespace allowed.
+    Bare numbers are NOT treated as durations — they're parsed as epoch seconds
+    by `parse_ts` instead.
+    """
+    s = (spec or "").strip().lower()
+    if not s or not _DURATION_FULL_RE.match(s):
+        return None
+    total = 0
+    for n_str, unit in _DURATION_TOKEN_RE.findall(s):
+        n = int(n_str)
+        if unit == "d":
+            total += n * 86400
+        elif unit == "h":
+            total += n * 3600
+        elif unit == "m":
+            total += n * 60
+        else:  # 's'
+            total += n
+    return float(total) if total > 0 else None
+
+
+def _first_transcript_ts(transcript_path: Path) -> float | None:
+    """Return the first row timestamp in `transcript_path` (parent only)."""
+    for r in iter_jsonl(transcript_path):
+        ts = parse_ts(r.get("timestamp"))
+        if ts is not None:
+            return ts
+    return None
+
+
+def _last_user_prompt_ts(transcript_path: Path) -> float | None:
+    """Return the timestamp of the most recent real user prompt in the parent transcript.
+
+    A "real" prompt is a `type: user` row whose message content is text — not a
+    `tool_result` payload (those rows are also `type: user` in Claude Code's
+    schema). Sidechain rows are skipped: they are subagent-internal user turns,
+    not human prompts, and would otherwise misanchor `--since last-prompt`.
+    """
+    out: float | None = None
+    for r in iter_jsonl(transcript_path):
+        if r.get("type") != "user":
+            continue
+        if r.get("isSidechain"):
+            continue
+        msg = r.get("message") or {}
+        content = msg.get("content")
+        is_text = (
+            isinstance(content, str)
+            or (
+                isinstance(content, list)
+                and any(
+                    isinstance(b, dict) and b.get("type") == "text"
+                    for b in content
+                )
+            )
+        )
+        if not is_text:
+            continue
+        ts = parse_ts(r.get("timestamp"))
+        if ts is not None:
+            out = ts
+    return out
+
+
+def resolve_when(
+    spec: str | None,
+    *,
+    transcript_path: Path,
+    role: str,
+    now: float | None = None,
+) -> float:
+    """Resolve a `--since` / `--until` token to an epoch float.
+
+    `role` is `"since"` or `"until"` and selects the default when `spec is None`
+    (`first` for since, `now` for until). Recognized literal tokens: `now`,
+    `first`, `last-prompt`. Otherwise tries ISO-8601 / epoch number, then
+    relative duration (`30m`, `1h30m`, ...).
+
+    Raises `ValueError` if the spec cannot be interpreted, or if a literal that
+    requires transcript scanning yields no timestamp.
+    """
+    now_ts = now if now is not None else time.time()
+    if spec is None:
+        if role == "since":
+            spec = "first"
+        elif role == "until":
+            spec = "now"
+        else:
+            raise ValueError(f"unknown role: {role!r}")
+    s = spec.strip()
+    if s == "now":
+        return now_ts
+    if s == "first":
+        ts = _first_transcript_ts(transcript_path)
+        if ts is None:
+            raise ValueError(
+                f"--{role}=first: transcript {transcript_path} has no timestamped rows"
+            )
+        return ts
+    if s == "last-prompt":
+        ts = _last_user_prompt_ts(transcript_path)
+        if ts is None:
+            raise ValueError(
+                f"--{role}=last-prompt: no user prompts found in {transcript_path}"
+            )
+        return ts
+    # Try ISO-8601 / epoch number — parse_ts handles both.
+    parsed = parse_ts(s)
+    if parsed is not None:
+        return parsed
+    # Fall back to relative duration "<N>{d,h,m,s}".
+    delta = _parse_duration(s)
+    if delta is not None:
+        return now_ts - delta
+    raise ValueError(
+        f"--{role}={spec!r}: not a recognized time spec (try ISO-8601, epoch "
+        f"seconds, '30m'-style duration, or a literal: now/first/last-prompt)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Subcommand implementations
 # ---------------------------------------------------------------------------
 
@@ -1512,17 +1649,18 @@ def cmd_mark(args) -> int:
     return 0
 
 
-def cmd_stop(args) -> int:
-    state = load_active()
-    if state is None:
-        sys.stderr.write("claude-code-profiler: no active profile.\n")
-        return 1
+def _aggregate_and_emit(state: dict, end_ts: float, prices, args) -> dict:
+    """Shared aggregation + artifact-emission body used by `stop` and `retro`.
 
-    end_ts = time.time()
+    Reads parent + subagent transcripts, runs the Aggregator over [start_ts,
+    end_ts], writes profile.json / profile.md / events.jsonl /
+    transcript.snippet.jsonl into `state["window_dir"]`, prints the report in
+    the requested format, and optionally exports the bundle. Does NOT mutate
+    the active-profile pointer — the caller owns that.
+    """
     transcript_path = Path(state["transcript_path"])
     rows, sub_files = load_session_rows(transcript_path)
 
-    prices = parse_prices_override(args.prices) or DEFAULT_PRICES
     agg = Aggregator(
         start_ts=state["start_ts"],
         end_ts=end_ts,
@@ -1538,12 +1676,15 @@ def cmd_stop(args) -> int:
     # Hook events (optional): if events.jsonl already exists in window dir,
     # ingest. (Hooks themselves write there directly when configured.)
     win_dir = Path(state["window_dir"])
+    win_dir.mkdir(parents=True, exist_ok=True)
     hook_events_path = win_dir / "events.from_hooks.jsonl"
     if hook_events_path.is_file():
         agg.feed_hook_events(list(iter_jsonl(hook_events_path)))
 
     rep = report_dict(state, agg, end_ts)
     rep["_window_dir"] = str(win_dir)
+    if state.get("mode"):
+        rep["mode"] = state["mode"]
 
     # Persist artifacts
     (win_dir / "profile.json").write_text(json.dumps(rep, indent=2, sort_keys=True))
@@ -1574,7 +1715,93 @@ def cmd_stop(args) -> int:
         shutil.copytree(win_dir, target)
         print(f"\nclaude-code-profiler: exported to {target}")
 
+    return rep
+
+
+def cmd_stop(args) -> int:
+    state = load_active()
+    if state is None:
+        sys.stderr.write("claude-code-profiler: no active profile.\n")
+        return 1
+
+    end_ts = time.time()
+    prices = parse_prices_override(args.prices) or DEFAULT_PRICES
+    _aggregate_and_emit(state, end_ts, prices, args)
     clear_active()
+    return 0
+
+
+def cmd_retro(args) -> int:
+    """Retroactively profile a window of the current session's transcript.
+
+    Unlike `start`+`stop`, this never required a prior `start` call — it scans
+    the existing transcript JSONL between `--since` and `--until` and emits the
+    same artifact bundle (profile.json/md, events.jsonl, transcript.snippet,
+    state.json) under `windows/<id>/`. The active-profile pointer is NOT
+    touched, so a retro can run alongside an in-progress `start`.
+    """
+    cwd = Path.cwd()
+    sess_env = os.environ.get("CLAUDE_SESSION_ID")
+    found = discover_transcript(cwd, prefer_session=sess_env)
+    if found is None:
+        sys.stderr.write(
+            f"claude-code-profiler: no transcript found under {PROJECTS_DIR}/{cwd_to_project_slug(cwd)}/.\n"
+            "Are you running from inside a Claude Code session in this cwd?\n"
+        )
+        return 2
+    transcript_path, session_id = found
+    now_ts = time.time()
+    try:
+        start_ts = resolve_when(args.since, transcript_path=transcript_path,
+                                role="since", now=now_ts)
+        end_ts = resolve_when(args.until, transcript_path=transcript_path,
+                              role="until", now=now_ts)
+    except ValueError as e:
+        sys.stderr.write(f"claude-code-profiler: {e}\n")
+        return 2
+    if start_ts >= end_ts:
+        sys.stderr.write(
+            f"claude-code-profiler: --since ({fmt_ts(start_ts)}) must be "
+            f"strictly before --until ({fmt_ts(end_ts)}).\n"
+        )
+        return 2
+
+    name = args.name or "retro"
+    window_id = make_window_id(name, start_ts)
+    win_dir = windows_dir() / window_id
+    win_dir.mkdir(parents=True, exist_ok=True)
+
+    # Detect model the same way `start` does — scan the parent transcript and
+    # take the most recent assistant turn's `model` field.
+    model = ""
+    for r in iter_jsonl(transcript_path):
+        if r.get("type") == "assistant":
+            model = ((r.get("message") or {}).get("model")) or model
+
+    state = {
+        "window_id": window_id,
+        "name": name,
+        "tags": dict(t.split("=", 1) for t in (args.tag or []) if "=" in t),
+        "note": args.note,
+        "marks": [],
+        "start_ts": start_ts,
+        "session_id": session_id,
+        "transcript_path": str(transcript_path),
+        "cwd": str(cwd),
+        "model_at_start": model,
+        "git": git_metadata(cwd),
+        "env": env_snapshot(),
+        "window_dir": str(win_dir),
+        # `mode` distinguishes retro bundles from live `start`+`stop` bundles
+        # in profile.json / state.json so future tooling can filter them.
+        "mode": "retroactive",
+        "since": args.since or "first",
+        "until": args.until or "now",
+    }
+    (win_dir / "state.json").write_text(json.dumps(state, indent=2))
+
+    prices = parse_prices_override(args.prices) or DEFAULT_PRICES
+    _aggregate_and_emit(state, end_ts, prices, args)
     return 0
 
 
@@ -1642,6 +1869,32 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--prices", default=None,
                     help="Override price table, e.g. 'opus:15,75,18.75,1.5;sonnet:3,15,3.75,0.3'")
     sp.set_defaults(func=cmd_stop)
+
+    sp = sub.add_parser(
+        "retro",
+        help="Retroactively profile a window of the current session (no prior `start` needed)",
+    )
+    sp.add_argument(
+        "--since", default=None,
+        help="Window start. Default `first` (first transcript timestamp). "
+             "Accepts: ISO-8601, epoch seconds, '30m'/'1h30m' duration ago, "
+             "or a literal: now/first/last-prompt.",
+    )
+    sp.add_argument(
+        "--until", default=None,
+        help="Window end. Default `now`. Same forms as --since.",
+    )
+    sp.add_argument("--name", default=None,
+                    help="Window label (used in the artifact dirname). Default 'retro'.")
+    sp.add_argument("--note", default=None)
+    sp.add_argument("--tag", action="append", default=[],
+                    help="key=value tag; repeatable")
+    sp.add_argument("--format", choices=("table", "markdown", "json"), default="table")
+    sp.add_argument("--export", default=None,
+                    help="Copy the profile's artifact bundle to this directory after the run")
+    sp.add_argument("--prices", default=None,
+                    help="Override price table, e.g. 'opus:15,75,18.75,1.5;sonnet:3,15,3.75,0.3'")
+    sp.set_defaults(func=cmd_retro)
 
     sp = sub.add_parser("reset", help="Discard the active profile without producing a report")
     sp.set_defaults(func=cmd_reset)
